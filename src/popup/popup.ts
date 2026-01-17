@@ -21,31 +21,38 @@ let selectedForDelete: Set<string> = new Set()
 let searchQuery: string = ''
 
 // Loading states
-let isInitialLoading = false
-let isSyncing = false  // Background sync in progress
 let deletingIds: Set<string> = new Set()
 
-// Sync progress
-let syncProgress = { current: 0, total: 0 }
-
-// Local cache
+// Cache data (read from storage)
 let cachedConversations: Conversation[] = []
-let lastSyncAt: number | null = null
-let totalCount: number | null = null
+let lastSyncTime: number | null = null
+let syncComplete = false
 
-// Constants
-const SYNC_BATCH_SIZE = 50
-const SYNC_DELAY_MS = 300  // Delay between batches to avoid rate limiting
+// Sync progress (read from storage)
+let syncProgress: { loaded: number, total: number } | null = null
 
-// Cache keys
-const CACHE_KEY = 'cached_conversations'
-const CACHE_META_KEY = 'cache_meta'
-
-// Settings keys
+// Cache keys (must match background.ts)
+const CACHE_KEY = 'conversationCache'
+const SYNC_PROGRESS_KEY = 'syncProgress'
+const SYNC_ERROR_KEY = 'syncError'
 const SETTINGS_KEY = 'settings'
 
+// Cache type (must match background.ts)
+interface ConversationCache {
+  conversations: Conversation[]
+  totalCount: number
+  lastSyncTime: number
+  syncComplete: boolean
+}
+
+interface SyncProgress {
+  loaded: number
+  total: number
+  inProgress?: boolean
+}
+
 // User preferences (loaded from storage)
-let backupBeforeDeletePref = false  // Default: false (user can enable)
+let backupBeforeDeletePref = false
 
 // Load user settings from storage
 async function loadSettings(): Promise<void> {
@@ -78,34 +85,36 @@ backupCheckbox.addEventListener('change', () => {
 // Load cache from storage
 async function loadCache(): Promise<boolean> {
   return new Promise((resolve) => {
-    chrome.storage.local.get([CACHE_KEY, CACHE_META_KEY], (result) => {
-      if (result[CACHE_KEY] && Array.isArray(result[CACHE_KEY])) {
-        cachedConversations = result[CACHE_KEY]
-        const meta = result[CACHE_META_KEY] as { lastSyncAt?: number, totalCount?: number } | undefined
-        lastSyncAt = meta?.lastSyncAt || null
-        totalCount = meta?.totalCount || cachedConversations.length
-        logger.log('Cache loaded:', cachedConversations.length, 'conversations')
+    chrome.storage.local.get([CACHE_KEY, SYNC_PROGRESS_KEY, SYNC_ERROR_KEY], (result) => {
+      logger.log('loadCache: result keys:', Object.keys(result))
+
+      const cache = result[CACHE_KEY] as {
+        conversations?: Conversation[]
+        totalCount?: number
+        lastSyncTime?: number
+        syncComplete?: boolean
+      } | undefined
+
+      if (cache?.conversations && Array.isArray(cache.conversations)) {
+        cachedConversations = cache.conversations
+        lastSyncTime = cache.lastSyncTime || null
+        syncComplete = cache.syncComplete || false
+        logger.log('loadCache: SUCCESS -', cachedConversations.length, 'conversations')
         resolve(true)
       } else {
+        logger.log('loadCache: NO CACHE FOUND')
         resolve(false)
       }
-    })
-  })
-}
 
-// Save cache to storage
-async function saveCache(): Promise<void> {
-  return new Promise((resolve) => {
-    const now = Date.now()
-    chrome.storage.local.set({
-      [CACHE_KEY]: cachedConversations,
-      [CACHE_META_KEY]: {
-        lastSyncAt: now,
-        totalCount: totalCount || cachedConversations.length
+      // Load sync progress if any
+      const progress = result[SYNC_PROGRESS_KEY] as { loaded: number, total: number } | undefined
+      syncProgress = progress || null
+
+      // Check for sync error
+      const syncError = result[SYNC_ERROR_KEY] as string | undefined
+      if (syncError) {
+        logger.error('Sync error from background:', syncError)
       }
-    }, () => {
-      lastSyncAt = now
-      resolve()
     })
   })
 }
@@ -158,18 +167,15 @@ function cleanSnippet(text: string, maxLength = 120): string {
 function extractSnippet(messages: Message[]): string {
   if (!messages || messages.length === 0) return ''
 
-  // Filter out system messages, reverse to get recent first
   const filtered = messages
     .filter(m => m.role === 'assistant' || m.role === 'user')
     .reverse()
 
-  // Prefer assistant message
   const assistantMsg = filtered.find(m => m.role === 'assistant')
   if (assistantMsg) {
     return cleanSnippet(assistantMsg.content)
   }
 
-  // Fall back to user message
   const userMsg = filtered.find(m => m.role === 'user')
   if (userMsg) {
     return cleanSnippet(userMsg.content)
@@ -184,58 +190,33 @@ type ErrorType = 'auth' | 'rate_limit' | 'network' | 'server' | 'not_found' | 'g
 interface ParsedError {
   type: ErrorType
   message: string
-  retryAfter?: number // seconds for rate limit
+  retryAfter?: number
 }
 
-// Parse API error for user-friendly message and type
 function parseErrorDetailed(error: string): ParsedError {
   if (error.includes('401') || error.includes('Unauthorized')) {
-    return {
-      type: 'auth',
-      message: 'Session expired. Please refresh the ChatGPT page to continue.'
-    }
+    return { type: 'auth', message: 'Session expired. Please refresh the ChatGPT page.' }
   }
   if (error.includes('403') || error.includes('Forbidden')) {
-    return {
-      type: 'auth',
-      message: 'Access denied. Please log in to ChatGPT first.'
-    }
+    return { type: 'auth', message: 'Access denied. Please log in to ChatGPT first.' }
   }
   if (error.includes('404')) {
-    return {
-      type: 'not_found',
-      message: 'Conversation not found. It may have been deleted.'
-    }
+    return { type: 'not_found', message: 'Conversation not found.' }
   }
   if (error.includes('429')) {
-    // Try to extract retry-after time from error message
     const retryMatch = error.match(/(\d+)\s*seconds?/i)
     const retryAfter = retryMatch ? parseInt(retryMatch[1]) : 30
-    return {
-      type: 'rate_limit',
-      message: 'Too many requests.',
-      retryAfter
-    }
+    return { type: 'rate_limit', message: 'Too many requests.', retryAfter }
   }
   if (error.includes('500') || error.includes('502') || error.includes('503')) {
-    return {
-      type: 'server',
-      message: 'ChatGPT is temporarily unavailable. Please try again in a moment.'
-    }
+    return { type: 'server', message: 'ChatGPT is temporarily unavailable.' }
   }
   if (error.includes('network') || error.includes('fetch') || error.includes('Failed to fetch')) {
-    return {
-      type: 'network',
-      message: 'Unable to connect. Please check your network.'
-    }
+    return { type: 'network', message: 'Unable to connect.' }
   }
-  return {
-    type: 'generic',
-    message: error
-  }
+  return { type: 'generic', message: error }
 }
 
-// Legacy parseError for simple use cases
 function parseError(error: string): string {
   return parseErrorDetailed(error).message
 }
@@ -244,11 +225,9 @@ function parseError(error: string): string {
 let rateLimitCountdown: number | null = null
 let rateLimitTimer: number | null = null
 
-// Show error with special handling for different error types
 function showErrorWithAction(error: string) {
   const parsed = parseErrorDetailed(error)
 
-  // Clear any existing rate limit timer
   if (rateLimitTimer) {
     clearInterval(rateLimitTimer)
     rateLimitTimer = null
@@ -269,7 +248,6 @@ function showErrorWithAction(error: string) {
   }
 }
 
-// Show auth error with refresh prompt
 function showAuthError(message: string) {
   errorDiv.innerHTML = `
     <div class="error-content">
@@ -284,12 +262,11 @@ function showAuthError(message: string) {
   errorDiv.className = 'error error-auth'
 
   document.getElementById('refreshPageBtn')?.addEventListener('click', async () => {
-    // Find ChatGPT tab and reload it
     try {
       const tabs = await chrome.tabs.query({ url: ['*://chatgpt.com/*', '*://chat.openai.com/*'] })
       if (tabs.length > 0 && tabs[0].id) {
         await chrome.tabs.reload(tabs[0].id)
-        errorDiv.innerHTML = '<span class="error-icon">✓</span> Refreshing ChatGPT... Please wait a moment then click Sync.'
+        errorDiv.innerHTML = '<span class="error-icon">✓</span> Refreshing ChatGPT...'
       } else {
         window.open('https://chatgpt.com', '_blank')
       }
@@ -299,7 +276,6 @@ function showAuthError(message: string) {
   })
 }
 
-// Show rate limit error with countdown
 function showRateLimitError(message: string, seconds: number) {
   rateLimitCountdown = seconds
 
@@ -317,7 +293,7 @@ function showRateLimitError(message: string, seconds: number) {
       errorDiv.className = 'error error-ready'
       document.getElementById('retryBtn')?.addEventListener('click', () => {
         clearError()
-        syncAllConversations()
+        triggerSync(true)
       })
       if (rateLimitTimer) {
         clearInterval(rateLimitTimer)
@@ -329,7 +305,7 @@ function showRateLimitError(message: string, seconds: number) {
     errorDiv.innerHTML = `
       <div class="error-content">
         <span class="error-icon">⏳</span>
-        <span class="error-message">${escapeHtml(message)} Please wait ${rateLimitCountdown}s...</span>
+        <span class="error-message">${escapeHtml(message)} Wait ${rateLimitCountdown}s...</span>
       </div>
     `
   }
@@ -346,7 +322,6 @@ function showRateLimitError(message: string, seconds: number) {
   }, 1000)
 }
 
-// Show network error with retry button
 function showNetworkError(message: string) {
   errorDiv.innerHTML = `
     <div class="error-content">
@@ -362,7 +337,7 @@ function showNetworkError(message: string) {
 
   document.getElementById('retryNetworkBtn')?.addEventListener('click', () => {
     clearError()
-    syncAllConversations()
+    triggerSync(true)
   })
 }
 
@@ -391,7 +366,7 @@ function hideConfirmDialog() {
 
 cancelBtn.addEventListener('click', hideConfirmDialog)
 
-// Optimistic delete handler
+// Delete handler
 confirmBtn.addEventListener('click', async () => {
   const isBatch = pendingDeleteIds.length > 0
   const idsToDelete = isBatch ? [...pendingDeleteIds] : (pendingDeleteId ? [pendingDeleteId] : [])
@@ -401,26 +376,18 @@ confirmBtn.addEventListener('click', async () => {
   const shouldBackup = backupCheckbox.checked
   hideConfirmDialog()
 
-  // Save original state for rollback
-  const originalConversations = [...cachedConversations]
-  const originalSelected = new Set(selectedForDelete)
-
-  // Optimistic UI update - immediately mark as deleting
+  // Optimistic UI update
   idsToDelete.forEach(id => {
     deletingIds.add(id)
     selectedForDelete.delete(id)
   })
-
-  // Update UI to show deleting state
   updateDeletingState()
 
-  // Process deletions
   const failedIds: string[] = []
   const failedErrors: string[] = []
 
   for (const id of idsToDelete) {
     try {
-      // Backup first if checked
       if (shouldBackup) {
         const backupResponse = await chrome.runtime.sendMessage({
           type: 'BACKUP_CONVERSATION',
@@ -433,7 +400,6 @@ confirmBtn.addEventListener('click', async () => {
         }
       }
 
-      // Delete
       const response = await chrome.runtime.sendMessage({
         type: 'DELETE_CONVERSATION',
         conversationId: id
@@ -442,9 +408,6 @@ confirmBtn.addEventListener('click', async () => {
       if (response.error) {
         failedIds.push(id)
         failedErrors.push(parseError(response.error))
-      } else {
-        // Success - remove from cache
-        cachedConversations = cachedConversations.filter(c => c.id !== id)
       }
     } catch (err) {
       failedIds.push(id)
@@ -454,27 +417,12 @@ confirmBtn.addEventListener('click', async () => {
     deletingIds.delete(id)
   }
 
-  // Handle failures
   if (failedIds.length > 0) {
-    if (failedIds.length === idsToDelete.length) {
-      // All failed - full rollback
-      cachedConversations = originalConversations
-      selectedForDelete = originalSelected
-    }
     showError(failedErrors[0])
   }
 
-  // Clear all deleting states
   deletingIds.clear()
-
-  // Save updated cache
-  await saveCache()
-
-  // Re-render without full loading
-  renderConversationList(cachedConversations)
-
-  // Silent refresh in background to sync with server
-  syncAllConversations()
+  // Cache is updated by background via storage change listener
 })
 
 // Update UI for items being deleted
@@ -491,26 +439,20 @@ function updateDeletingState() {
     }
   })
 
-  // Disable batch delete button if any deletion in progress
   const batchBtn = document.getElementById('batchDeleteBtn') as HTMLButtonElement
   if (batchBtn && deletingIds.size > 0) {
     batchBtn.disabled = true
   }
 }
 
-// Helper function for delay
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
-}
-
 // Render bottom sync status bar
 function renderSyncStatusBar(): string {
-  if (cachedConversations.length === 0 && !isSyncing) return ''
+  if (cachedConversations.length === 0 && !syncProgress) return ''
 
-  if (isSyncing) {
+  if (syncProgress) {
     const progressText = syncProgress.total > 0
-      ? `${syncProgress.current}/${syncProgress.total}`
-      : `${syncProgress.current}`
+      ? `${syncProgress.loaded}/${syncProgress.total}`
+      : `${syncProgress.loaded}`
     return `
       <div class="sync-status-bar syncing">
         <span class="sync-indicator spinning"></span>
@@ -520,7 +462,7 @@ function renderSyncStatusBar(): string {
   }
 
   const countText = `${cachedConversations.length} conversations`
-  const timeText = lastSyncAt ? `Last sync: ${formatRelativeTime(lastSyncAt)}` : ''
+  const timeText = lastSyncTime ? `Last sync: ${formatRelativeTime(lastSyncTime)}` : ''
 
   return `
     <div class="sync-status-bar">
@@ -535,10 +477,10 @@ function updateSyncStatusBar() {
   const statusBar = document.querySelector('.sync-status-bar')
   if (!statusBar) return
 
-  if (isSyncing) {
+  if (syncProgress) {
     const progressText = syncProgress.total > 0
-      ? `${syncProgress.current}/${syncProgress.total}`
-      : `${syncProgress.current}`
+      ? `${syncProgress.loaded}/${syncProgress.total}`
+      : `${syncProgress.loaded}`
     statusBar.className = 'sync-status-bar syncing'
     statusBar.innerHTML = `
       <span class="sync-indicator spinning"></span>
@@ -546,91 +488,26 @@ function updateSyncStatusBar() {
     `
   } else {
     const countText = `${cachedConversations.length} conversations`
-    const timeText = lastSyncAt ? `Last sync: ${formatRelativeTime(lastSyncAt)}` : ''
+    const timeText = lastSyncTime ? `Last sync: ${formatRelativeTime(lastSyncTime)}` : ''
     statusBar.className = 'sync-status-bar'
     statusBar.innerHTML = `
       <span>${countText}${timeText ? ' · ' + timeText : ''}</span>
       <button id="manualSyncBtn" class="manual-sync-btn" title="Sync now">↻</button>
     `
-    // Re-attach handler
-    document.getElementById('manualSyncBtn')?.addEventListener('click', () => {
-      if (!isSyncing) syncAllConversations()
-    })
+    attachSyncButtonHandler()
   }
 }
 
-// Fetch all conversations silently in background
-async function syncAllConversations() {
-  if (isSyncing) return
-
-  isSyncing = true
-  syncProgress = { current: 0, total: 0 }
-  updateSyncStatusBar()
-
-  try {
-    const allConversations: Conversation[] = []
-    let offset = 0
-    let hasMore = true
-
-    while (hasMore) {
-      const response = await chrome.runtime.sendMessage({
-        type: 'GET_CONVERSATIONS',
-        offset,
-        limit: SYNC_BATCH_SIZE
-      })
-
-      if (response.error) {
-        logger.error('Sync failed:', response.error)
-        // If we have some data, keep it; otherwise show error
-        if (allConversations.length === 0 && cachedConversations.length === 0) {
-          showErrorWithAction(response.error)
-        }
-        break
-      }
-
-      if (response.data?.items) {
-        allConversations.push(...response.data.items)
-        syncProgress = {
-          current: allConversations.length,
-          total: response.data.total || allConversations.length
-        }
-        totalCount = response.data.total || allConversations.length
-        updateSyncStatusBar()
-
-        hasMore = response.data.has_more ?? false
-        offset += SYNC_BATCH_SIZE
-
-        // Delay between requests to avoid rate limiting
-        if (hasMore) {
-          await sleep(SYNC_DELAY_MS)
-        }
-      } else {
-        break
-      }
-    }
-
-    // Update cache with all conversations
-    if (allConversations.length > 0) {
-      cachedConversations = allConversations
-      await saveCache()
-
-      // Re-render if no deletion in progress
-      if (deletingIds.size === 0) {
-        renderConversationList(cachedConversations)
-      }
-    }
-  } catch (err) {
-    logger.error('Sync error:', err)
-  } finally {
-    isSyncing = false
-    updateSyncStatusBar()
-  }
+// Trigger sync in background
+function triggerSync(forceRefresh = false) {
+  logger.log('Triggering background sync, forceRefresh:', forceRefresh)
+  chrome.runtime.sendMessage({ type: 'START_SYNC', forceRefresh })
 }
 
 // Attach sync button handler
 function attachSyncButtonHandler() {
   document.getElementById('manualSyncBtn')?.addEventListener('click', () => {
-    if (!isSyncing) syncAllConversations()
+    triggerSync(true)
   })
 }
 
@@ -701,16 +578,12 @@ async function showConversationPreview(conversationId: string, title: string) {
       return
     }
 
-    // Extract and save snippet to cache
     const messages = response.data.messages
     const snippet = extractSnippet(messages)
     const conv = cachedConversations.find(c => c.id === conversationId)
     if (conv) {
       conv.snippet = snippet
       conv.messageCount = messages.length
-      // Update cache in storage
-      saveCache()
-      // Update the snippet display in the list
       updateConversationSnippet(conversationId, snippet, messages.length)
     }
 
@@ -729,7 +602,6 @@ async function showConversationPreview(conversationId: string, title: string) {
   }
 }
 
-// Update snippet in the DOM without full re-render
 function updateConversationSnippet(conversationId: string, snippet: string, messageCount: number) {
   const item = document.querySelector(`.conversation-item[data-id="${conversationId}"]`)
   if (item) {
@@ -762,7 +634,6 @@ function updateBatchDeleteBtn() {
   }
 }
 
-// Filter conversations by search query
 function filterConversations(conversations: Conversation[], query: string): Conversation[] {
   if (!query.trim()) return conversations
   const lowerQuery = query.toLowerCase().trim()
@@ -773,7 +644,6 @@ function filterConversations(conversations: Conversation[], query: string): Conv
   })
 }
 
-// Render search box
 function renderSearchBox(): string {
   return `
     <div class="search-box">
@@ -784,7 +654,6 @@ function renderSearchBox(): string {
   `
 }
 
-// Attach search handlers
 function attachSearchHandlers() {
   const searchInput = document.getElementById('searchInput') as HTMLInputElement
   const clearBtn = document.getElementById('clearSearchBtn') as HTMLButtonElement
@@ -792,7 +661,6 @@ function attachSearchHandlers() {
   searchInput?.addEventListener('input', () => {
     searchQuery = searchInput.value
     clearBtn?.classList.toggle('hidden', !searchQuery)
-    // Only update list items, don't re-render entire layout
     updateListItems()
   })
 
@@ -805,7 +673,6 @@ function attachSearchHandlers() {
   })
 }
 
-// Update only the list items without re-rendering the entire layout
 function updateListItems() {
   const listContainer = document.querySelector('.conversation-list')
   const resultCountEl = document.querySelector('.search-result-count')
@@ -814,7 +681,6 @@ function updateListItems() {
 
   const filteredConversations = filterConversations(cachedConversations, searchQuery)
 
-  // Update result count
   if (resultCountEl) {
     if (searchQuery) {
       resultCountEl.textContent = `${filteredConversations.length} results`
@@ -824,7 +690,6 @@ function updateListItems() {
     }
   }
 
-  // Handle no results case
   if (filteredConversations.length === 0 && searchQuery) {
     listContainer.innerHTML = `
       <div class="no-results">
@@ -836,7 +701,6 @@ function updateListItems() {
     return
   }
 
-  // Generate list HTML
   const listHtml = filteredConversations.map(conv => {
     const isDeleting = deletingIds.has(conv.id)
     const snippetText = conv.snippet || ''
@@ -859,16 +723,12 @@ function updateListItems() {
   `}).join('')
 
   listContainer.innerHTML = listHtml
-
-  // Re-attach event handlers for list items
   attachListItemHandlers()
 }
 
-// Attach handlers to list items (extracted for reuse)
 function attachListItemHandlers() {
   const selectAllCheckbox = document.getElementById('selectAllCheckbox') as HTMLInputElement
 
-  // Individual checkboxes
   contentDiv.querySelectorAll('.conv-checkbox').forEach(cb => {
     cb.addEventListener('change', (e) => {
       e.stopPropagation()
@@ -883,14 +743,12 @@ function attachListItemHandlers() {
       }
       updateBatchDeleteBtn()
 
-      // Update select all state
       const allCheckboxes = contentDiv.querySelectorAll('.conv-checkbox:not(:disabled)') as NodeListOf<HTMLInputElement>
       const allChecked = Array.from(allCheckboxes).every(c => c.checked)
       if (selectAllCheckbox) selectAllCheckbox.checked = allChecked
     })
   })
 
-  // Click on item to preview
   contentDiv.querySelectorAll('.conv-content').forEach(el => {
     el.addEventListener('click', () => {
       const item = el.parentElement
@@ -900,7 +758,6 @@ function attachListItemHandlers() {
     })
   })
 
-  // Click delete button
   contentDiv.querySelectorAll('.conv-delete-btn').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation()
@@ -914,16 +771,13 @@ function attachListItemHandlers() {
 }
 
 function renderConversationList(conversations: Conversation[]) {
-  // Don't clear selectedForDelete if just re-rendering after delete
   const preserveSelection = deletingIds.size > 0
   if (!preserveSelection) {
     selectedForDelete.clear()
   }
 
-  // Filter by search query
   const filteredConversations = filterConversations(conversations, searchQuery)
 
-  // No conversations at all
   if (conversations.length === 0) {
     contentDiv.innerHTML = `
       ${renderTabs()}
@@ -950,7 +804,6 @@ function renderConversationList(conversations: Conversation[]) {
     return
   }
 
-  // Has conversations but search returned no results
   if (filteredConversations.length === 0 && searchQuery) {
     contentDiv.innerHTML = `
       ${renderTabs()}
@@ -1004,7 +857,6 @@ function renderConversationList(conversations: Conversation[]) {
     </div>
   `}).join('')
 
-  // Result count
   const resultCountHtml = `<div class="search-result-count ${searchQuery ? '' : 'hidden'}">${searchQuery ? `${filteredConversations.length} results` : ''}</div>`
 
   contentDiv.innerHTML = `
@@ -1040,7 +892,6 @@ function renderConversationList(conversations: Conversation[]) {
   attachTabHandlers()
   attachSearchHandlers()
 
-  // Select all checkbox
   const selectAllCheckbox = document.getElementById('selectAllCheckbox') as HTMLInputElement
   selectAllCheckbox?.addEventListener('change', () => {
     const checkboxes = contentDiv.querySelectorAll('.conv-checkbox:not(:disabled)') as NodeListOf<HTMLInputElement>
@@ -1058,7 +909,6 @@ function renderConversationList(conversations: Conversation[]) {
     updateBatchDeleteBtn()
   })
 
-  // Batch delete button
   const batchDeleteBtn = document.getElementById('batchDeleteBtn')
   batchDeleteBtn?.addEventListener('click', () => {
     if (selectedForDelete.size > 0 && deletingIds.size === 0) {
@@ -1066,13 +916,9 @@ function renderConversationList(conversations: Conversation[]) {
     }
   })
 
-  // Attach list item handlers (checkboxes, preview, delete buttons)
   attachListItemHandlers()
-
-  // Attach sync button handler
   attachSyncButtonHandler()
 }
-
 
 interface Backup {
   id: string
@@ -1150,9 +996,7 @@ function attachTabHandlers() {
       if (view && view !== currentView) {
         currentView = view
         if (view === 'conversations') {
-          // Use cached data, trigger background sync
           renderConversationList(cachedConversations)
-          syncAllConversations()
         } else {
           renderBackupList()
         }
@@ -1161,7 +1005,6 @@ function attachTabHandlers() {
   })
 }
 
-// Show initial loading state when no cache
 function showInitialLoading() {
   contentDiv.innerHTML = `
     ${renderTabs()}
@@ -1188,31 +1031,76 @@ function showInitialLoading() {
   attachTabHandlers()
 }
 
+// Listen for storage changes from background
+function setupStorageListener() {
+  chrome.storage.onChanged.addListener((changes, namespace) => {
+    if (namespace !== 'local') return
+
+    logger.log('Storage changed:', Object.keys(changes))
+
+    // Update conversation cache
+    if (changes[CACHE_KEY]?.newValue) {
+      const cache = changes[CACHE_KEY].newValue as ConversationCache
+      cachedConversations = cache.conversations || []
+      lastSyncTime = cache.lastSyncTime || null
+      syncComplete = cache.syncComplete || false
+      logger.log('Cache updated:', cachedConversations.length, 'conversations')
+
+      if (currentView === 'conversations' && deletingIds.size === 0) {
+        renderConversationList(cachedConversations)
+      }
+    }
+
+    // Update sync progress
+    if (changes[SYNC_PROGRESS_KEY]) {
+      const progress = changes[SYNC_PROGRESS_KEY].newValue as SyncProgress | undefined
+      syncProgress = progress || null
+      updateSyncStatusBar()
+    }
+
+    // Handle sync error
+    if (changes[SYNC_ERROR_KEY]?.newValue) {
+      const errorMsg = changes[SYNC_ERROR_KEY].newValue as string
+      showErrorWithAction(errorMsg)
+    }
+  })
+}
+
 async function init() {
+  logger.log('init: START')
   clearError()
 
-  // Load user settings (backup preference)
+  // Setup storage listener first
+  setupStorageListener()
+
+  // Load user settings
   await loadSettings()
+  logger.log('init: settings loaded')
 
-  // Step 1: Load cache first (instant display)
+  // Load cache immediately (instant display)
   const hasCache = await loadCache()
+  logger.log('init: hasCache =', hasCache, 'conversations:', cachedConversations.length)
 
-  if (hasCache) {
-    // Have cache - render immediately
+  if (hasCache && cachedConversations.length > 0) {
+    logger.log('init: rendering cached list immediately')
     renderConversationList(cachedConversations)
   } else {
-    // No cache - show loading state
+    logger.log('init: no cache, showing loading state')
     showInitialLoading()
   }
 
-  // Step 2: Check token
+  // Check token
+  logger.log('init: checking token status')
   const hasToken = await checkTokenStatus()
+  logger.log('init: hasToken =', hasToken)
 
   if (hasToken) {
-    // Start background sync (will update UI when done)
-    syncAllConversations()
+    // Trigger background sync (non-blocking)
+    logger.log('init: triggering background sync')
+    triggerSync()
   } else {
     if (!hasCache) {
+      logger.log('init: no token and no cache, showing instructions')
       contentDiv.innerHTML = `
         ${renderTabs()}
         <div class="main-layout">
@@ -1240,6 +1128,7 @@ async function init() {
       attachTabHandlers()
     }
   }
+  logger.log('init: END')
 }
 
 init()
