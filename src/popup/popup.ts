@@ -680,12 +680,23 @@ function updateLoadAllProgress() {
 
 // Render Load More section
 function renderLoadMoreSection(): string {
-  if (!hasMore) return ''
+  // Always show section if we have conversations
+  if (cachedConversations.length === 0) return ''
 
   const loadedText = totalConversations
-    ? `Showing ${cachedConversations.length} of ${totalConversations} conversations`
+    ? `Loaded ${cachedConversations.length} of ${totalConversations} conversations`
     : `Loaded ${cachedConversations.length} conversations`
 
+  // If all loaded, show completion message
+  if (!hasMore) {
+    return `
+      <div class="load-more-section load-complete">
+        <div class="load-more-info">${loadedText} ✓</div>
+      </div>
+    `
+  }
+
+  // Has more to load - show buttons
   return `
     <div class="load-more-section">
       <div class="load-more-info">${loadedText}</div>

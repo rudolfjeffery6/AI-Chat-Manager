@@ -1240,3 +1240,13 @@ h1 {
   color: var(--orange);
   font-style: italic;
 }
+
+/* Load complete state */
+.load-more-section.load-complete {
+  padding: var(--space-md);
+}
+
+.load-more-section.load-complete .load-more-info {
+  color: var(--success);
+  margin-bottom: 0;
+}

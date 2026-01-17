@@ -56,8 +56,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return
         }
         try {
-          const data = await getConversations(token, message.offset || 0, message.limit || 28)
-          sendResponse({ data })
+          const offset = message.offset || 0
+          const limit = message.limit || 28
+          const data = await getConversations(token, offset, limit)
+          // Calculate has_more from API response
+          const loadedCount = offset + data.items.length
+          const has_more = loadedCount < data.total
+          sendResponse({
+            data: {
+              ...data,
+              has_more
+            }
+          })
         } catch (err) {
           logger.error('Failed to fetch conversations:', err)
           sendResponse({ error: String(err) })
