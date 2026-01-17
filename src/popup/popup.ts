@@ -685,15 +685,125 @@ function attachSearchHandlers() {
   searchInput?.addEventListener('input', () => {
     searchQuery = searchInput.value
     clearBtn?.classList.toggle('hidden', !searchQuery)
-    renderConversationList(cachedConversations)
+    // Only update list items, don't re-render entire layout
+    updateListItems()
   })
 
   clearBtn?.addEventListener('click', () => {
     searchQuery = ''
     if (searchInput) searchInput.value = ''
     clearBtn.classList.add('hidden')
-    renderConversationList(cachedConversations)
+    updateListItems()
+    searchInput?.focus()
   })
+}
+
+// Update only the list items without re-rendering the entire layout
+function updateListItems() {
+  const listContainer = document.querySelector('.conversation-list')
+  const resultCountEl = document.querySelector('.search-result-count')
+
+  if (!listContainer) return
+
+  const filteredConversations = filterConversations(cachedConversations, searchQuery)
+
+  // Update result count
+  if (resultCountEl) {
+    if (searchQuery) {
+      resultCountEl.textContent = `${filteredConversations.length} of ${cachedConversations.length} conversations`
+      resultCountEl.classList.remove('hidden')
+    } else {
+      resultCountEl.classList.add('hidden')
+    }
+  }
+
+  // Handle no results case
+  if (filteredConversations.length === 0 && searchQuery) {
+    listContainer.innerHTML = `
+      <div class="no-results">
+        <div class="no-results-icon">🔍</div>
+        <div class="no-results-text">No conversations match "${escapeHtml(searchQuery)}"</div>
+        <div class="no-results-hint">Try a different search term</div>
+      </div>
+    `
+    return
+  }
+
+  // Generate list HTML
+  const listHtml = filteredConversations.map(conv => {
+    const isDeleting = deletingIds.has(conv.id)
+    const snippetText = conv.snippet || ''
+    const countText = conv.messageCount ? `${conv.messageCount} msgs` : ''
+    return `
+    <div class="conversation-item ${isDeleting ? 'deleting' : ''}" data-id="${conv.id}" data-title="${escapeHtml(conv.title || 'Untitled')}">
+      <input type="checkbox" class="conv-checkbox" data-id="${conv.id}" ${selectedForDelete.has(conv.id) ? 'checked' : ''} ${isDeleting ? 'disabled' : ''}>
+      <div class="conv-content">
+        <div class="conv-title">${escapeHtml(conv.title || 'Untitled')}</div>
+        <div class="conv-snippet">${snippetText ? escapeHtml(snippetText) : '<span class="no-preview">(Click to load preview)</span>'}</div>
+        <div class="conv-meta">
+          <span class="conv-date">${formatRelativeTime(new Date(conv.update_time).getTime())}</span>
+          ${countText ? `<span class="conv-count">${countText}</span>` : ''}
+        </div>
+      </div>
+      <button class="conv-delete-btn" data-id="${conv.id}" data-title="${escapeHtml(conv.title || 'Untitled')}" title="Delete" ${isDeleting ? 'disabled' : ''}>
+        ${isDeleting ? '<span class="spinner-small"></span>' : '×'}
+      </button>
+    </div>
+  `}).join('')
+
+  listContainer.innerHTML = listHtml
+
+  // Re-attach event handlers for list items
+  attachListItemHandlers()
+}
+
+// Attach handlers to list items (extracted for reuse)
+function attachListItemHandlers() {
+  const selectAllCheckbox = document.getElementById('selectAllCheckbox') as HTMLInputElement
+
+  // Individual checkboxes
+  contentDiv.querySelectorAll('.conv-checkbox').forEach(cb => {
+    cb.addEventListener('change', (e) => {
+      e.stopPropagation()
+      const checkbox = cb as HTMLInputElement
+      const id = checkbox.getAttribute('data-id')
+      if (id) {
+        if (checkbox.checked) {
+          selectedForDelete.add(id)
+        } else {
+          selectedForDelete.delete(id)
+        }
+      }
+      updateBatchDeleteBtn()
+
+      // Update select all state
+      const allCheckboxes = contentDiv.querySelectorAll('.conv-checkbox:not(:disabled)') as NodeListOf<HTMLInputElement>
+      const allChecked = Array.from(allCheckboxes).every(c => c.checked)
+      if (selectAllCheckbox) selectAllCheckbox.checked = allChecked
+    })
+  })
+
+  // Click on item to preview
+  contentDiv.querySelectorAll('.conv-content').forEach(el => {
+    el.addEventListener('click', () => {
+      const item = el.parentElement
+      const id = item?.getAttribute('data-id')
+      const title = item?.getAttribute('data-title') || 'Untitled'
+      if (id && !deletingIds.has(id)) showConversationPreview(id, title)
+    })
+  })
+
+  // Click delete button
+  contentDiv.querySelectorAll('.conv-delete-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      const id = btn.getAttribute('data-id')
+      const title = btn.getAttribute('data-title') || 'Untitled'
+      if (id && !deletingIds.has(id)) showConfirmDialog(id, title)
+    })
+  })
+
+  updateBatchDeleteBtn()
 }
 
 function renderConversationList(conversations: Conversation[]) {
@@ -795,10 +905,8 @@ function renderConversationList(conversations: Conversation[]) {
     </div>
   `}).join('')
 
-  // Show result count when searching
-  const resultCountHtml = searchQuery
-    ? `<div class="search-result-count">${filteredConversations.length} of ${conversations.length} conversations</div>`
-    : ''
+  // Result count (always render, toggle visibility via class)
+  const resultCountHtml = `<div class="search-result-count ${searchQuery ? '' : 'hidden'}">${searchQuery ? `${filteredConversations.length} of ${conversations.length} conversations` : ''}</div>`
 
   contentDiv.innerHTML = `
     ${renderTabs()}
@@ -852,28 +960,6 @@ function renderConversationList(conversations: Conversation[]) {
     updateBatchDeleteBtn()
   })
 
-  // Individual checkboxes
-  contentDiv.querySelectorAll('.conv-checkbox').forEach(cb => {
-    cb.addEventListener('change', (e) => {
-      e.stopPropagation()
-      const checkbox = cb as HTMLInputElement
-      const id = checkbox.getAttribute('data-id')
-      if (id) {
-        if (checkbox.checked) {
-          selectedForDelete.add(id)
-        } else {
-          selectedForDelete.delete(id)
-        }
-      }
-      updateBatchDeleteBtn()
-
-      // Update select all state
-      const allCheckboxes = contentDiv.querySelectorAll('.conv-checkbox:not(:disabled)') as NodeListOf<HTMLInputElement>
-      const allChecked = Array.from(allCheckboxes).every(c => c.checked)
-      if (selectAllCheckbox) selectAllCheckbox.checked = allChecked
-    })
-  })
-
   // Batch delete button
   const batchDeleteBtn = document.getElementById('batchDeleteBtn')
   batchDeleteBtn?.addEventListener('click', () => {
@@ -882,27 +968,8 @@ function renderConversationList(conversations: Conversation[]) {
     }
   })
 
-  // Click on item to preview
-  contentDiv.querySelectorAll('.conv-content').forEach(el => {
-    el.addEventListener('click', () => {
-      const item = el.parentElement
-      const id = item?.getAttribute('data-id')
-      const title = item?.getAttribute('data-title') || 'Untitled'
-      if (id && !deletingIds.has(id)) showConversationPreview(id, title)
-    })
-  })
-
-  // Click delete button
-  contentDiv.querySelectorAll('.conv-delete-btn').forEach(btn => {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation()
-      const id = btn.getAttribute('data-id')
-      const title = btn.getAttribute('data-title') || 'Untitled'
-      if (id && !deletingIds.has(id)) showConfirmDialog(id, title)
-    })
-  })
-
-  updateBatchDeleteBtn()
+  // Attach list item handlers (checkboxes, preview, delete buttons)
+  attachListItemHandlers()
 }
 
 function attachSyncHandler() {
