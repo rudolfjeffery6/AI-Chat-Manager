@@ -222,7 +222,7 @@
             "Handle empty state: show helpful 'No conversations' message",
             "Verify: Simulate each error, appropriate message shown"
           ],
-          "passes": false
+          "passes": true
         },
         {
           "id": 5,

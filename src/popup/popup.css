@@ -193,6 +193,10 @@ h1 {
    Error Message
    ----------------------------- */
 .error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
   padding: var(--space-md) var(--space-lg);
   margin-bottom: var(--space-md);
   background: var(--danger-light);
@@ -201,6 +205,103 @@ h1 {
   color: var(--danger);
   font-size: 13px;
   flex-shrink: 0;
+}
+
+.error-content {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex: 1;
+  min-width: 0;
+}
+
+.error-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+.error-message {
+  flex: 1;
+  min-width: 0;
+}
+
+.error-action-btn {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+  padding: var(--space-xs) var(--space-md);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--danger);
+  background: var(--bg-card);
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: all var(--transition);
+}
+
+.error-action-btn:hover {
+  background: var(--danger);
+  color: white;
+}
+
+/* Auth error - warm orange tone */
+.error.error-auth {
+  background: var(--orange-lightest);
+  border-color: var(--orange-light);
+  color: var(--orange-dark);
+}
+
+.error.error-auth .error-action-btn {
+  color: var(--orange);
+  border-color: var(--orange);
+}
+
+.error.error-auth .error-action-btn:hover {
+  background: var(--orange);
+  color: white;
+}
+
+/* Rate limit error */
+.error.error-rate-limit {
+  background: #FFF8E6;
+  border-color: #E6D4A3;
+  color: #8B7355;
+}
+
+/* Network error */
+.error.error-network {
+  background: var(--bg-secondary);
+  border-color: var(--border);
+  color: var(--text-secondary);
+}
+
+.error.error-network .error-action-btn {
+  color: var(--text-secondary);
+  border-color: var(--text-muted);
+}
+
+.error.error-network .error-action-btn:hover {
+  background: var(--text-secondary);
+  color: white;
+}
+
+/* Ready state (after countdown) */
+.error.error-ready {
+  background: #E8F5E9;
+  border-color: #A5D6A7;
+  color: var(--success);
+}
+
+.error.error-ready .error-action-btn {
+  color: var(--success);
+  border-color: var(--success);
+}
+
+.error.error-ready .error-action-btn:hover {
+  background: var(--success);
+  color: white;
 }
 
 .hidden {

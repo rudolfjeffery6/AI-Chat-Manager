@@ -165,27 +165,192 @@ function extractSnippet(messages: Message[]): string {
   return ''
 }
 
-// Parse API error for user-friendly message
-function parseError(error: string): string {
+// Error types for special handling
+type ErrorType = 'auth' | 'rate_limit' | 'network' | 'server' | 'not_found' | 'generic'
+
+interface ParsedError {
+  type: ErrorType
+  message: string
+  retryAfter?: number // seconds for rate limit
+}
+
+// Parse API error for user-friendly message and type
+function parseErrorDetailed(error: string): ParsedError {
   if (error.includes('401') || error.includes('Unauthorized')) {
-    return 'Session expired. Please refresh ChatGPT page and try again.'
+    return {
+      type: 'auth',
+      message: 'Session expired. Please refresh the ChatGPT page to continue.'
+    }
   }
   if (error.includes('403') || error.includes('Forbidden')) {
-    return 'Access denied. Please check if you are logged in to ChatGPT.'
+    return {
+      type: 'auth',
+      message: 'Access denied. Please log in to ChatGPT first.'
+    }
   }
   if (error.includes('404')) {
-    return 'Conversation not found. It may have been already deleted.'
+    return {
+      type: 'not_found',
+      message: 'Conversation not found. It may have been deleted.'
+    }
   }
   if (error.includes('429')) {
-    return 'Too many requests. Please wait a moment and try again.'
+    // Try to extract retry-after time from error message
+    const retryMatch = error.match(/(\d+)\s*seconds?/i)
+    const retryAfter = retryMatch ? parseInt(retryMatch[1]) : 30
+    return {
+      type: 'rate_limit',
+      message: 'Too many requests.',
+      retryAfter
+    }
   }
   if (error.includes('500') || error.includes('502') || error.includes('503')) {
-    return 'ChatGPT server error. Please try again later.'
+    return {
+      type: 'server',
+      message: 'ChatGPT is temporarily unavailable. Please try again in a moment.'
+    }
   }
-  if (error.includes('network') || error.includes('fetch')) {
-    return 'Network error. Please check your connection.'
+  if (error.includes('network') || error.includes('fetch') || error.includes('Failed to fetch')) {
+    return {
+      type: 'network',
+      message: 'Unable to connect. Please check your network.'
+    }
   }
-  return error
+  return {
+    type: 'generic',
+    message: error
+  }
+}
+
+// Legacy parseError for simple use cases
+function parseError(error: string): string {
+  return parseErrorDetailed(error).message
+}
+
+// Rate limit countdown state
+let rateLimitCountdown: number | null = null
+let rateLimitTimer: number | null = null
+
+// Show error with special handling for different error types
+function showErrorWithAction(error: string) {
+  const parsed = parseErrorDetailed(error)
+
+  // Clear any existing rate limit timer
+  if (rateLimitTimer) {
+    clearInterval(rateLimitTimer)
+    rateLimitTimer = null
+  }
+
+  switch (parsed.type) {
+    case 'auth':
+      showAuthError(parsed.message)
+      break
+    case 'rate_limit':
+      showRateLimitError(parsed.message, parsed.retryAfter || 30)
+      break
+    case 'network':
+      showNetworkError(parsed.message)
+      break
+    default:
+      showError(parsed.message)
+  }
+}
+
+// Show auth error with refresh prompt
+function showAuthError(message: string) {
+  errorDiv.innerHTML = `
+    <div class="error-content">
+      <span class="error-icon">🔑</span>
+      <span class="error-message">${escapeHtml(message)}</span>
+    </div>
+    <button class="error-action-btn" id="refreshPageBtn">
+      <span>↻</span> Refresh ChatGPT
+    </button>
+  `
+  errorDiv.classList.remove('hidden')
+  errorDiv.className = 'error error-auth'
+
+  document.getElementById('refreshPageBtn')?.addEventListener('click', async () => {
+    // Find ChatGPT tab and reload it
+    try {
+      const tabs = await chrome.tabs.query({ url: ['*://chatgpt.com/*', '*://chat.openai.com/*'] })
+      if (tabs.length > 0 && tabs[0].id) {
+        await chrome.tabs.reload(tabs[0].id)
+        errorDiv.innerHTML = '<span class="error-icon">✓</span> Refreshing ChatGPT... Please wait a moment then click Sync.'
+      } else {
+        window.open('https://chatgpt.com', '_blank')
+      }
+    } catch {
+      window.open('https://chatgpt.com', '_blank')
+    }
+  })
+}
+
+// Show rate limit error with countdown
+function showRateLimitError(message: string, seconds: number) {
+  rateLimitCountdown = seconds
+
+  const updateDisplay = () => {
+    if (rateLimitCountdown === null || rateLimitCountdown <= 0) {
+      errorDiv.innerHTML = `
+        <div class="error-content">
+          <span class="error-icon">✓</span>
+          <span class="error-message">Ready to retry</span>
+        </div>
+        <button class="error-action-btn" id="retryBtn">
+          <span>↻</span> Retry Now
+        </button>
+      `
+      errorDiv.className = 'error error-ready'
+      document.getElementById('retryBtn')?.addEventListener('click', () => {
+        clearError()
+        silentRefresh()
+      })
+      if (rateLimitTimer) {
+        clearInterval(rateLimitTimer)
+        rateLimitTimer = null
+      }
+      return
+    }
+
+    errorDiv.innerHTML = `
+      <div class="error-content">
+        <span class="error-icon">⏳</span>
+        <span class="error-message">${escapeHtml(message)} Please wait ${rateLimitCountdown}s...</span>
+      </div>
+    `
+  }
+
+  errorDiv.classList.remove('hidden')
+  errorDiv.className = 'error error-rate-limit'
+  updateDisplay()
+
+  rateLimitTimer = window.setInterval(() => {
+    if (rateLimitCountdown !== null) {
+      rateLimitCountdown--
+      updateDisplay()
+    }
+  }, 1000)
+}
+
+// Show network error with retry button
+function showNetworkError(message: string) {
+  errorDiv.innerHTML = `
+    <div class="error-content">
+      <span class="error-icon">📡</span>
+      <span class="error-message">${escapeHtml(message)}</span>
+    </div>
+    <button class="error-action-btn" id="retryNetworkBtn">
+      <span>↻</span> Retry
+    </button>
+  `
+  errorDiv.classList.remove('hidden')
+  errorDiv.className = 'error error-network'
+
+  document.getElementById('retryNetworkBtn')?.addEventListener('click', () => {
+    clearError()
+    silentRefresh()
+  })
 }
 
 // Confirmation Dialog
@@ -865,7 +1030,7 @@ async function loadConversations() {
   try {
     const response = await chrome.runtime.sendMessage({ type: 'GET_CONVERSATIONS', limit: 20 })
     if (response.error) {
-      showError(parseError(response.error))
+      showErrorWithAction(response.error)
       // Still render cached data if available
       if (cachedConversations.length > 0) {
         renderConversationList(cachedConversations)
@@ -904,7 +1069,7 @@ async function loadConversations() {
     isInitialLoading = false
     renderConversationList(cachedConversations)
   } catch (err) {
-    showError(`Failed to load conversations: ${parseError(String(err))}`)
+    showErrorWithAction(String(err))
     if (cachedConversations.length > 0) {
       renderConversationList(cachedConversations)
     }
