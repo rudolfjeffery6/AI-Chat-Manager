@@ -1,0 +1,58 @@
+{
+  "extName": {
+    "message": "ChatGPT Manager",
+    "description": "The name of the extension"
+  },
+  "extDescription": {
+    "message": "Manage your ChatGPT conversations with ease. List, preview, search, and delete conversations without refreshing the page.",
+    "description": "The description of the extension shown in Chrome Web Store"
+  },
+  "tokenAcquired": {
+    "message": "Token acquired",
+    "description": "Status message when auth token is successfully obtained"
+  },
+  "noToken": {
+    "message": "No token - Please open ChatGPT first",
+    "description": "Status message when no auth token is available"
+  },
+  "loading": {
+    "message": "Loading...",
+    "description": "Generic loading message"
+  },
+  "noConversations": {
+    "message": "No conversations found",
+    "description": "Message when conversation list is empty"
+  },
+  "deleteConfirm": {
+    "message": "Are you sure you want to delete this conversation?",
+    "description": "Delete confirmation dialog message"
+  },
+  "backupBeforeDelete": {
+    "message": "Backup before delete",
+    "description": "Checkbox label for backup option"
+  },
+  "cancel": {
+    "message": "Cancel",
+    "description": "Cancel button text"
+  },
+  "confirmDelete": {
+    "message": "Confirm Delete",
+    "description": "Confirm delete button text"
+  },
+  "conversations": {
+    "message": "Conversations",
+    "description": "Tab label for conversations"
+  },
+  "backups": {
+    "message": "Backups",
+    "description": "Tab label for backups"
+  },
+  "preview": {
+    "message": "Preview",
+    "description": "Preview panel header"
+  },
+  "searchPlaceholder": {
+    "message": "Search conversations...",
+    "description": "Search input placeholder"
+  }
+}
