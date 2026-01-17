@@ -20,23 +20,22 @@ let currentView: 'conversations' | 'backups' = 'conversations'
 let selectedForDelete: Set<string> = new Set()
 let searchQuery: string = ''
 
-// Loading states - cache-first approach
-let isInitialLoading = false  // Only true when NO cache exists
-let isRefreshing = false      // True during background refresh
+// Loading states
+let isInitialLoading = false
+let isSyncing = false  // Background sync in progress
 let deletingIds: Set<string> = new Set()
 
-// Pagination states
-const DEFAULT_LIMIT = 50  // Default conversations per load
-let totalConversations: number | null = null  // Total count from server
-let hasMore = false  // Whether more conversations exist
-let isLoadingMore = false  // Loading more in progress
-let isLoadingAll = false  // Load all in progress
-let loadAllCancelled = false  // User cancelled load all
-let loadingProgress = { current: 0, total: 0 }  // Progress for load all
+// Sync progress
+let syncProgress = { current: 0, total: 0 }
 
 // Local cache
 let cachedConversations: Conversation[] = []
 let lastSyncAt: number | null = null
+let totalCount: number | null = null
+
+// Constants
+const SYNC_BATCH_SIZE = 50
+const SYNC_DELAY_MS = 300  // Delay between batches to avoid rate limiting
 
 // Cache keys
 const CACHE_KEY = 'cached_conversations'
@@ -82,8 +81,9 @@ async function loadCache(): Promise<boolean> {
     chrome.storage.local.get([CACHE_KEY, CACHE_META_KEY], (result) => {
       if (result[CACHE_KEY] && Array.isArray(result[CACHE_KEY])) {
         cachedConversations = result[CACHE_KEY]
-        const meta = result[CACHE_META_KEY] as { lastSyncAt?: number } | undefined
+        const meta = result[CACHE_META_KEY] as { lastSyncAt?: number, totalCount?: number } | undefined
         lastSyncAt = meta?.lastSyncAt || null
+        totalCount = meta?.totalCount || cachedConversations.length
         logger.log('Cache loaded:', cachedConversations.length, 'conversations')
         resolve(true)
       } else {
@@ -96,11 +96,15 @@ async function loadCache(): Promise<boolean> {
 // Save cache to storage
 async function saveCache(): Promise<void> {
   return new Promise((resolve) => {
+    const now = Date.now()
     chrome.storage.local.set({
       [CACHE_KEY]: cachedConversations,
-      [CACHE_META_KEY]: { lastSyncAt: Date.now() }
+      [CACHE_META_KEY]: {
+        lastSyncAt: now,
+        totalCount: totalCount || cachedConversations.length
+      }
     }, () => {
-      lastSyncAt = Date.now()
+      lastSyncAt = now
       resolve()
     })
   })
@@ -313,7 +317,7 @@ function showRateLimitError(message: string, seconds: number) {
       errorDiv.className = 'error error-ready'
       document.getElementById('retryBtn')?.addEventListener('click', () => {
         clearError()
-        silentRefresh()
+        syncAllConversations()
       })
       if (rateLimitTimer) {
         clearInterval(rateLimitTimer)
@@ -358,7 +362,7 @@ function showNetworkError(message: string) {
 
   document.getElementById('retryNetworkBtn')?.addEventListener('click', () => {
     clearError()
-    silentRefresh()
+    syncAllConversations()
   })
 }
 
@@ -470,7 +474,7 @@ confirmBtn.addEventListener('click', async () => {
   renderConversationList(cachedConversations)
 
   // Silent refresh in background to sync with server
-  silentRefresh()
+  syncAllConversations()
 })
 
 // Update UI for items being deleted
@@ -494,235 +498,140 @@ function updateDeletingState() {
   }
 }
 
-// Update sync status display
-function updateSyncStatus() {
-  const syncStatus = document.getElementById('syncStatus')
-  if (!syncStatus) return
+// Helper function for delay
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
 
-  if (isRefreshing) {
-    syncStatus.innerHTML = '<span class="spinner-small"></span> Syncing...'
-    syncStatus.className = 'sync-status syncing'
-  } else if (lastSyncAt) {
-    syncStatus.innerHTML = `Last sync: ${formatRelativeTime(lastSyncAt)}`
-    syncStatus.className = 'sync-status'
+// Render bottom sync status bar
+function renderSyncStatusBar(): string {
+  if (cachedConversations.length === 0 && !isSyncing) return ''
+
+  if (isSyncing) {
+    const progressText = syncProgress.total > 0
+      ? `${syncProgress.current}/${syncProgress.total}`
+      : `${syncProgress.current}`
+    return `
+      <div class="sync-status-bar syncing">
+        <span class="sync-indicator spinning"></span>
+        <span>Syncing... ${progressText}</span>
+      </div>
+    `
+  }
+
+  const countText = `${cachedConversations.length} conversations`
+  const timeText = lastSyncAt ? `Last sync: ${formatRelativeTime(lastSyncAt)}` : ''
+
+  return `
+    <div class="sync-status-bar">
+      <span>${countText}${timeText ? ' · ' + timeText : ''}</span>
+      <button id="manualSyncBtn" class="manual-sync-btn" title="Sync now">↻</button>
+    </div>
+  `
+}
+
+// Update sync status bar without full re-render
+function updateSyncStatusBar() {
+  const statusBar = document.querySelector('.sync-status-bar')
+  if (!statusBar) return
+
+  if (isSyncing) {
+    const progressText = syncProgress.total > 0
+      ? `${syncProgress.current}/${syncProgress.total}`
+      : `${syncProgress.current}`
+    statusBar.className = 'sync-status-bar syncing'
+    statusBar.innerHTML = `
+      <span class="sync-indicator spinning"></span>
+      <span>Syncing... ${progressText}</span>
+    `
   } else {
-    syncStatus.innerHTML = 'Not synced'
-    syncStatus.className = 'sync-status'
+    const countText = `${cachedConversations.length} conversations`
+    const timeText = lastSyncAt ? `Last sync: ${formatRelativeTime(lastSyncAt)}` : ''
+    statusBar.className = 'sync-status-bar'
+    statusBar.innerHTML = `
+      <span>${countText}${timeText ? ' · ' + timeText : ''}</span>
+      <button id="manualSyncBtn" class="manual-sync-btn" title="Sync now">↻</button>
+    `
+    // Re-attach handler
+    document.getElementById('manualSyncBtn')?.addEventListener('click', () => {
+      if (!isSyncing) syncAllConversations()
+    })
   }
 }
 
-// Silent refresh - fetch from server without showing loading
-async function silentRefresh() {
-  if (isRefreshing) return
+// Fetch all conversations silently in background
+async function syncAllConversations() {
+  if (isSyncing) return
 
-  isRefreshing = true
-  updateSyncStatus()
+  isSyncing = true
+  syncProgress = { current: 0, total: 0 }
+  updateSyncStatusBar()
 
   try {
-    const response = await chrome.runtime.sendMessage({ type: 'GET_CONVERSATIONS', limit: DEFAULT_LIMIT })
-    if (!response.error && response.data?.items) {
-      cachedConversations = response.data.items
-      totalConversations = response.data.total ?? null
-      hasMore = response.data.has_more ?? false
+    const allConversations: Conversation[] = []
+    let offset = 0
+    let hasMore = true
+
+    while (hasMore) {
+      const response = await chrome.runtime.sendMessage({
+        type: 'GET_CONVERSATIONS',
+        offset,
+        limit: SYNC_BATCH_SIZE
+      })
+
+      if (response.error) {
+        logger.error('Sync failed:', response.error)
+        // If we have some data, keep it; otherwise show error
+        if (allConversations.length === 0 && cachedConversations.length === 0) {
+          showErrorWithAction(response.error)
+        }
+        break
+      }
+
+      if (response.data?.items) {
+        allConversations.push(...response.data.items)
+        syncProgress = {
+          current: allConversations.length,
+          total: response.data.total || allConversations.length
+        }
+        totalCount = response.data.total || allConversations.length
+        updateSyncStatusBar()
+
+        hasMore = response.data.has_more ?? false
+        offset += SYNC_BATCH_SIZE
+
+        // Delay between requests to avoid rate limiting
+        if (hasMore) {
+          await sleep(SYNC_DELAY_MS)
+        }
+      } else {
+        break
+      }
+    }
+
+    // Update cache with all conversations
+    if (allConversations.length > 0) {
+      cachedConversations = allConversations
       await saveCache()
-      // Only re-render if no deletion in progress
+
+      // Re-render if no deletion in progress
       if (deletingIds.size === 0) {
         renderConversationList(cachedConversations)
       }
     }
   } catch (err) {
-    logger.error('Silent refresh failed:', err)
+    logger.error('Sync error:', err)
   } finally {
-    isRefreshing = false
-    updateSyncStatus()
+    isSyncing = false
+    updateSyncStatusBar()
   }
 }
 
-// Load more conversations (append to existing)
-async function loadMoreConversations() {
-  if (isLoadingMore || isLoadingAll) return
-
-  isLoadingMore = true
-  updateLoadMoreButton()
-
-  try {
-    const offset = cachedConversations.length
-    const response = await chrome.runtime.sendMessage({
-      type: 'GET_CONVERSATIONS',
-      offset,
-      limit: DEFAULT_LIMIT
-    })
-
-    if (!response.error && response.data?.items) {
-      // Append new items
-      cachedConversations = [...cachedConversations, ...response.data.items]
-      totalConversations = response.data.total ?? totalConversations
-      hasMore = response.data.has_more ?? false
-      await saveCache()
-      renderConversationList(cachedConversations)
-    } else if (response.error) {
-      showErrorWithAction(response.error)
-    }
-  } catch (err) {
-    showErrorWithAction(String(err))
-  } finally {
-    isLoadingMore = false
-    updateLoadMoreButton()
-  }
-}
-
-// Load all conversations with progress
-async function loadAllConversations() {
-  if (isLoadingMore || isLoadingAll) return
-
-  isLoadingAll = true
-  loadAllCancelled = false
-  loadingProgress = { current: cachedConversations.length, total: totalConversations || 0 }
-  updateLoadAllProgress()
-
-  try {
-    while (hasMore && !loadAllCancelled) {
-      const offset = cachedConversations.length
-      const response = await chrome.runtime.sendMessage({
-        type: 'GET_CONVERSATIONS',
-        offset,
-        limit: DEFAULT_LIMIT
-      })
-
-      if (loadAllCancelled) break
-
-      if (!response.error && response.data?.items) {
-        cachedConversations = [...cachedConversations, ...response.data.items]
-        totalConversations = response.data.total ?? totalConversations
-        hasMore = response.data.has_more ?? false
-        loadingProgress = {
-          current: cachedConversations.length,
-          total: totalConversations || cachedConversations.length
-        }
-        updateLoadAllProgress()
-        await saveCache()
-      } else if (response.error) {
-        showErrorWithAction(response.error)
-        break
-      }
-    }
-
-    // Final render
-    renderConversationList(cachedConversations)
-  } catch (err) {
-    showErrorWithAction(String(err))
-  } finally {
-    isLoadingAll = false
-    loadAllCancelled = false
-    updateLoadMoreButton()
-  }
-}
-
-// Cancel load all operation
-function cancelLoadAll() {
-  loadAllCancelled = true
-}
-
-// Update Load More button state
-function updateLoadMoreButton() {
-  const loadMoreBtn = document.getElementById('loadMoreBtn') as HTMLButtonElement
-  const loadAllBtn = document.getElementById('loadAllBtn') as HTMLButtonElement
-
-  if (loadMoreBtn) {
-    loadMoreBtn.disabled = isLoadingMore || isLoadingAll
-    loadMoreBtn.textContent = isLoadingMore ? 'Loading...' : 'Load More'
-  }
-
-  if (loadAllBtn) {
-    loadAllBtn.disabled = isLoadingMore || isLoadingAll
-  }
-}
-
-// Update Load All progress display
-function updateLoadAllProgress() {
-  const loadAllBtn = document.getElementById('loadAllBtn') as HTMLButtonElement
-  const progressDiv = document.getElementById('loadAllProgress')
-  const cancelBtn = document.getElementById('cancelLoadAllBtn')
-
-  if (isLoadingAll) {
-    if (loadAllBtn) {
-      loadAllBtn.disabled = true
-      loadAllBtn.classList.add('hidden')
-    }
-    if (progressDiv) {
-      const percent = loadingProgress.total > 0
-        ? Math.round((loadingProgress.current / loadingProgress.total) * 100)
-        : 0
-      progressDiv.innerHTML = `
-        <span class="progress-text">Loading ${loadingProgress.current} / ${loadingProgress.total} (${percent}%)</span>
-        <div class="progress-bar">
-          <div class="progress-fill" style="width: ${percent}%"></div>
-        </div>
-      `
-      progressDiv.classList.remove('hidden')
-    }
-    if (cancelBtn) {
-      cancelBtn.classList.remove('hidden')
-    }
-  } else {
-    if (loadAllBtn) {
-      loadAllBtn.classList.remove('hidden')
-      loadAllBtn.disabled = false
-    }
-    if (progressDiv) {
-      progressDiv.classList.add('hidden')
-    }
-    if (cancelBtn) {
-      cancelBtn.classList.add('hidden')
-    }
-  }
-}
-
-// Render Load More section
-function renderLoadMoreSection(): string {
-  // Always show section if we have conversations
-  if (cachedConversations.length === 0) return ''
-
-  const loadedText = totalConversations
-    ? `Loaded ${cachedConversations.length} of ${totalConversations} conversations`
-    : `Loaded ${cachedConversations.length} conversations`
-
-  // If all loaded, show completion message
-  if (!hasMore) {
-    return `
-      <div class="load-more-section load-complete">
-        <div class="load-more-info">${loadedText} ✓</div>
-      </div>
-    `
-  }
-
-  // Has more to load - show buttons
-  return `
-    <div class="load-more-section">
-      <div class="load-more-info">${loadedText}</div>
-      <div class="load-more-actions">
-        <button id="loadMoreBtn" class="load-more-btn" ${isLoadingMore || isLoadingAll ? 'disabled' : ''}>
-          ${isLoadingMore ? 'Loading...' : 'Load More'}
-        </button>
-        <button id="loadAllBtn" class="load-all-btn ${isLoadingAll ? 'hidden' : ''}" ${isLoadingMore || isLoadingAll ? 'disabled' : ''}>
-          Load All
-        </button>
-        <div id="loadAllProgress" class="load-all-progress hidden"></div>
-        <button id="cancelLoadAllBtn" class="cancel-load-btn hidden">Cancel</button>
-      </div>
-    </div>
-  `
-}
-
-// Attach Load More handlers
-function attachLoadMoreHandlers() {
-  const loadMoreBtn = document.getElementById('loadMoreBtn')
-  const loadAllBtn = document.getElementById('loadAllBtn')
-  const cancelBtn = document.getElementById('cancelLoadAllBtn')
-
-  loadMoreBtn?.addEventListener('click', loadMoreConversations)
-  loadAllBtn?.addEventListener('click', loadAllConversations)
-  cancelBtn?.addEventListener('click', cancelLoadAll)
+// Attach sync button handler
+function attachSyncButtonHandler() {
+  document.getElementById('manualSyncBtn')?.addEventListener('click', () => {
+    if (!isSyncing) syncAllConversations()
+  })
 }
 
 async function checkTokenStatus(): Promise<boolean> {
@@ -905,13 +814,10 @@ function updateListItems() {
 
   const filteredConversations = filterConversations(cachedConversations, searchQuery)
 
-  // Update result count with partial data warning
+  // Update result count
   if (resultCountEl) {
     if (searchQuery) {
-      const partialWarning = hasMore
-        ? ` (searching ${cachedConversations.length} of ${totalConversations || '?'} loaded)`
-        : ''
-      resultCountEl.innerHTML = `${filteredConversations.length} results<span class="partial-data-hint">${partialWarning}</span>`
+      resultCountEl.textContent = `${filteredConversations.length} results`
       resultCountEl.classList.remove('hidden')
     } else {
       resultCountEl.classList.add('hidden')
@@ -1017,22 +923,14 @@ function renderConversationList(conversations: Conversation[]) {
   // Filter by search query
   const filteredConversations = filterConversations(conversations, searchQuery)
 
-  // Sync status bar
-  const syncStatusHtml = `
-    <div class="sync-bar">
-      <span id="syncStatus" class="sync-status">${lastSyncAt ? `Last sync: ${formatRelativeTime(lastSyncAt)}` : 'Not synced'}</span>
-      <button id="syncBtn" class="sync-btn" title="Refresh">↻</button>
-    </div>
-  `
-
   // No conversations at all
   if (conversations.length === 0) {
     contentDiv.innerHTML = `
       ${renderTabs()}
       <div class="main-layout">
         <div class="left-panel">
-          ${syncStatusHtml}
-          <p class="empty">No conversations found. Click ↻ to sync.</p>
+          <p class="empty">No conversations found.</p>
+          ${renderSyncStatusBar()}
         </div>
         <div class="right-panel">
           <div class="right-panel-header">Preview</div>
@@ -1048,7 +946,7 @@ function renderConversationList(conversations: Conversation[]) {
       </div>
     `
     attachTabHandlers()
-    attachSyncHandler()
+    attachSyncButtonHandler()
     return
   }
 
@@ -1058,13 +956,13 @@ function renderConversationList(conversations: Conversation[]) {
       ${renderTabs()}
       <div class="main-layout">
         <div class="left-panel">
-          ${syncStatusHtml}
           ${renderSearchBox()}
           <div class="no-results">
             <div class="no-results-icon">🔍</div>
             <div class="no-results-text">No conversations match "${escapeHtml(searchQuery)}"</div>
             <div class="no-results-hint">Try a different search term</div>
           </div>
+          ${renderSyncStatusBar()}
         </div>
         <div class="right-panel">
           <div class="right-panel-header">Preview</div>
@@ -1080,8 +978,8 @@ function renderConversationList(conversations: Conversation[]) {
       </div>
     `
     attachTabHandlers()
-    attachSyncHandler()
     attachSearchHandlers()
+    attachSyncButtonHandler()
     return
   }
 
@@ -1106,17 +1004,13 @@ function renderConversationList(conversations: Conversation[]) {
     </div>
   `}).join('')
 
-  // Result count with partial data warning
-  const partialWarning = hasMore && searchQuery
-    ? ` <span class="partial-data-hint">(searching ${conversations.length} of ${totalConversations || '?'} loaded)</span>`
-    : ''
-  const resultCountHtml = `<div class="search-result-count ${searchQuery ? '' : 'hidden'}">${searchQuery ? `${filteredConversations.length} results${partialWarning}` : ''}</div>`
+  // Result count
+  const resultCountHtml = `<div class="search-result-count ${searchQuery ? '' : 'hidden'}">${searchQuery ? `${filteredConversations.length} results` : ''}</div>`
 
   contentDiv.innerHTML = `
     ${renderTabs()}
     <div class="main-layout">
       <div class="left-panel">
-        ${syncStatusHtml}
         ${renderSearchBox()}
         ${resultCountHtml}
         <div class="batch-actions">
@@ -1127,7 +1021,7 @@ function renderConversationList(conversations: Conversation[]) {
           <button id="batchDeleteBtn" class="batch-delete-btn" disabled>Delete</button>
         </div>
         <div class="conversation-list">${listHtml}</div>
-        ${renderLoadMoreSection()}
+        ${renderSyncStatusBar()}
       </div>
       <div class="right-panel">
         <div class="right-panel-header">Preview</div>
@@ -1144,7 +1038,6 @@ function renderConversationList(conversations: Conversation[]) {
   `
 
   attachTabHandlers()
-  attachSyncHandler()
   attachSearchHandlers()
 
   // Select all checkbox
@@ -1176,18 +1069,10 @@ function renderConversationList(conversations: Conversation[]) {
   // Attach list item handlers (checkboxes, preview, delete buttons)
   attachListItemHandlers()
 
-  // Attach Load More handlers
-  attachLoadMoreHandlers()
+  // Attach sync button handler
+  attachSyncButtonHandler()
 }
 
-function attachSyncHandler() {
-  const syncBtn = document.getElementById('syncBtn')
-  syncBtn?.addEventListener('click', () => {
-    if (!isRefreshing) {
-      silentRefresh()
-    }
-  })
-}
 
 interface Backup {
   id: string
@@ -1265,9 +1150,9 @@ function attachTabHandlers() {
       if (view && view !== currentView) {
         currentView = view
         if (view === 'conversations') {
-          // Use cached data, trigger silent refresh
+          // Use cached data, trigger background sync
           renderConversationList(cachedConversations)
-          silentRefresh()
+          syncAllConversations()
         } else {
           renderBackupList()
         }
@@ -1276,81 +1161,31 @@ function attachTabHandlers() {
   })
 }
 
-// Initial load with cache-first approach
-async function loadConversations() {
-  // Only show full loading if NO cache AND initial load
-  if (isInitialLoading && cachedConversations.length === 0) {
-    contentDiv.innerHTML = `
-      ${renderTabs()}
-      <div class="main-layout">
-        <div class="left-panel">
-          <p class="loading">Loading conversations...</p>
+// Show initial loading state when no cache
+function showInitialLoading() {
+  contentDiv.innerHTML = `
+    ${renderTabs()}
+    <div class="main-layout">
+      <div class="left-panel">
+        <div class="sync-status-bar syncing">
+          <span class="sync-indicator spinning"></span>
+          <span>Loading conversations...</span>
         </div>
-        <div class="right-panel">
-          <div class="right-panel-header">Preview</div>
-          <div class="right-panel-content">
-            <div id="preview" class="preview">
-              <div class="preview-empty">
-                <div class="preview-empty-icon">💬</div>
-                <div>Loading...</div>
-              </div>
+      </div>
+      <div class="right-panel">
+        <div class="right-panel-header">Preview</div>
+        <div class="right-panel-content">
+          <div id="preview" class="preview">
+            <div class="preview-empty">
+              <div class="preview-empty-icon">💬</div>
+              <div>Loading...</div>
             </div>
           </div>
         </div>
       </div>
-    `
-    attachTabHandlers()
-  }
-
-  try {
-    const response = await chrome.runtime.sendMessage({ type: 'GET_CONVERSATIONS', limit: DEFAULT_LIMIT })
-    if (response.error) {
-      showErrorWithAction(response.error)
-      // Still render cached data if available
-      if (cachedConversations.length > 0) {
-        renderConversationList(cachedConversations)
-      } else {
-        contentDiv.innerHTML = `
-          ${renderTabs()}
-          <div class="main-layout">
-            <div class="left-panel">
-              <div class="sync-bar">
-                <span class="sync-status error">Failed to load</span>
-                <button id="syncBtn" class="sync-btn" title="Retry">↻</button>
-              </div>
-              <p class="empty">Click ↻ to retry</p>
-            </div>
-            <div class="right-panel">
-              <div class="right-panel-header">Preview</div>
-              <div class="right-panel-content">
-                <div id="preview" class="preview">
-                  <div class="preview-empty">
-                    <div class="preview-empty-icon">💬</div>
-                    <div>No preview available</div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        `
-        attachTabHandlers()
-        attachSyncHandler()
-      }
-      return
-    }
-
-    cachedConversations = response.data.items
-    totalConversations = response.data.total ?? null
-    hasMore = response.data.has_more ?? false
-    await saveCache()
-    isInitialLoading = false
-    renderConversationList(cachedConversations)
-  } catch (err) {
-    showErrorWithAction(String(err))
-    if (cachedConversations.length > 0) {
-      renderConversationList(cachedConversations)
-    }
-  }
+    </div>
+  `
+  attachTabHandlers()
 }
 
 async function init() {
@@ -1359,29 +1194,23 @@ async function init() {
   // Load user settings (backup preference)
   await loadSettings()
 
-  // Step 1: Load cache first (instant)
+  // Step 1: Load cache first (instant display)
   const hasCache = await loadCache()
 
   if (hasCache) {
-    // Have cache - render immediately, no loading state
-    isInitialLoading = false
+    // Have cache - render immediately
     renderConversationList(cachedConversations)
   } else {
-    // No cache - mark as initial loading
-    isInitialLoading = true
+    // No cache - show loading state
+    showInitialLoading()
   }
 
   // Step 2: Check token
   const hasToken = await checkTokenStatus()
 
   if (hasToken) {
-    if (hasCache) {
-      // Have cache - silent refresh in background
-      silentRefresh()
-    } else {
-      // No cache - do initial load (will show loading)
-      await loadConversations()
-    }
+    // Start background sync (will update UI when done)
+    syncAllConversations()
   } else {
     if (!hasCache) {
       contentDiv.innerHTML = `
