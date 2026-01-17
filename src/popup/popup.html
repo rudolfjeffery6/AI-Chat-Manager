@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ChatGPT Manager</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <!-- Delete Confirmation Dialog - MUST be first -->
+  <div id="confirmDialog" class="dialog-overlay" style="display: none;">
+    <div class="dialog">
+      <div class="dialog-title">Delete Conversation?</div>
+      <div id="dialogMessage" class="dialog-message"></div>
+      <label class="checkbox-label">
+        <input type="checkbox" id="backupCheckbox">
+        <span>Backup before delete</span>
+      </label>
+      <div class="dialog-actions">
+        <button id="cancelBtn" type="button" class="btn btn-secondary">Cancel</button>
+        <button id="confirmBtn" type="button" class="btn btn-danger">Confirm Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="app">
+    <h1>ChatGPT Manager</h1>
+    <div id="error" class="error hidden"></div>
+    <div id="tokenStatus" class="token-status"></div>
+    <div id="content">
+      <p>Loading...</p>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

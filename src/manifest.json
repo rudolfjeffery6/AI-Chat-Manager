@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "ChatGPT Conversation Manager",
+  "version": "1.0.0",
+  "description": "Manage ChatGPT conversations - list, preview, and delete",
+  "permissions": ["tabs", "storage", "activeTab"],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "ChatGPT Manager"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
+      "js": ["content/content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

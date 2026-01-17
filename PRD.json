@@ -1,0 +1,248 @@
+{
+  "project_name": "ChatGPT Conversation Manager",
+  "one_liner": "Chrome extension to manage ChatGPT conversations - list, preview, and delete without page refresh",
+  "tech_stack": ["TypeScript", "HTML", "CSS", "Chrome Extension MV3", "Webpack"],
+  "created_at": "2026-01-15",
+  "hard_constraints": [
+    "NEVER refresh ChatGPT page",
+    "NEVER cause user to re-login",
+    "DELETE operations MUST have confirmation dialog"
+  ],
+  "reference": "Session Buddy (list management UX)",
+  "target": "Chrome Web Store publishable",
+  "sprints": [
+    {
+      "id": 0,
+      "name": "Sprint 0: Extension Foundation + TypeScript",
+      "goal": "Working extension skeleton with TypeScript build, verified communication paths",
+      "gate": "All features passes:true before Sprint 1",
+      "features": [
+        {
+          "id": 1,
+          "name": "TypeScript Build Configuration",
+          "steps": [
+            "Create package.json with name, version, scripts",
+            "Install devDependencies: typescript, webpack, webpack-cli, ts-loader, copy-webpack-plugin",
+            "Create tsconfig.json with strict mode, target ES2020, module ESNext",
+            "Create webpack.config.js with entry points for background, popup, content",
+            "Verify: Run npm run build, dist/ folder created without errors"
+          ],
+          "passes": true
+        },
+        {
+          "id": 2,
+          "name": "Minimal Extension Skeleton",
+          "steps": [
+            "Create src/manifest.json with MV3, name, version, permissions: [tabs, storage, activeTab]",
+            "Create src/background.ts with console.log('background loaded')",
+            "Create src/popup/popup.html with basic structure",
+            "Create src/popup/popup.ts with console.log('popup loaded')",
+            "Run npm run build to compile",
+            "Load dist/ in chrome://extensions Developer Mode",
+            "Verify: Extension loads without errors, click icon shows popup"
+          ],
+          "passes": true
+        },
+        {
+          "id": 3,
+          "name": "Content Script Injection to ChatGPT",
+          "steps": [
+            "Add content_scripts to manifest.json: matches ['https://chatgpt.com/*', 'https://chat.openai.com/*']",
+            "Create src/content/content.ts with console.log('content script injected into ChatGPT')",
+            "Update webpack.config.js to include content entry",
+            "Rebuild and reload extension",
+            "Verify: Open chatgpt.com, DevTools Console shows 'content script injected'"
+          ],
+          "passes": true
+        },
+        {
+          "id": 4,
+          "name": "Popup to Background Communication",
+          "steps": [
+            "In popup.ts: add button click handler that sends {type: 'PING'}",
+            "In background.ts: chrome.runtime.onMessage listener, respond with {type: 'PONG', time: Date.now()}",
+            "Display response in popup",
+            "Verify: Click button in popup, see PONG response displayed"
+          ],
+          "passes": true
+        },
+        {
+          "id": 5,
+          "name": "Background to Content Communication",
+          "steps": [
+            "In background.ts: on receiving 'GET_PAGE_INFO', query active tab and sendMessage to content",
+            "In content.ts: onMessage listener, respond with {url: location.href, title: document.title}",
+            "In popup.ts: trigger 'GET_PAGE_INFO', display page info",
+            "Verify: Open popup on ChatGPT page, see page URL and title displayed"
+          ],
+          "passes": true
+        },
+        {
+          "id": 6,
+          "name": "Error Visibility Setup",
+          "steps": [
+            "Create src/utils/logger.ts with log, warn, error functions",
+            "Wrap all message handlers in try-catch, call logger.error on failure",
+            "Add error display area in popup.html",
+            "Test: Intentionally cause error (e.g., send to non-existent tab)",
+            "Verify: Error message appears in popup, not silently swallowed"
+          ],
+          "passes": true
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "name": "Sprint 1: Core API Integration",
+      "goal": "Fetch, preview, and delete ChatGPT conversations via API",
+      "gate": "All API operations work correctly before UI polish",
+      "features": [
+        {
+          "id": 1,
+          "name": "Extract ChatGPT Auth Token",
+          "steps": [
+            "In content.ts: read accessToken from window.__NEXT_DATA__ or session storage",
+            "Send token to background via message",
+            "Store token in chrome.storage.session",
+            "Verify: Open ChatGPT, popup shows 'Token acquired' status"
+          ],
+          "passes": true
+        },
+        {
+          "id": 2,
+          "name": "Fetch Conversation List API",
+          "steps": [
+            "Create src/api/chatgpt.ts with getConversations(token, offset, limit)",
+            "Call GET https://chatgpt.com/backend-api/conversations with Bearer token",
+            "Parse response: items array with id, title, create_time, update_time",
+            "In background.ts: handle 'GET_CONVERSATIONS' message, call API",
+            "Verify: Popup displays list of conversation titles (raw text, no styling)"
+          ],
+          "passes": true
+        },
+        {
+          "id": 3,
+          "name": "Fetch Single Conversation Detail",
+          "steps": [
+            "Add getConversation(token, conversationId) to chatgpt.ts",
+            "Call GET https://chatgpt.com/backend-api/conversation/{id}",
+            "Parse response: extract last N messages from mapping",
+            "Handle 'GET_CONVERSATION_DETAIL' message in background",
+            "Verify: Click conversation in popup, see last 3 messages displayed (plain text)"
+          ],
+          "passes": true
+        },
+        {
+          "id": 4,
+          "name": "Delete Conversation API",
+          "steps": [
+            "Add deleteConversation(token, conversationId) to chatgpt.ts",
+            "Call PATCH https://chatgpt.com/backend-api/conversation/{id} with body {is_visible: false}",
+            "Handle 'DELETE_CONVERSATION' message in background",
+            "Return success/failure status",
+            "Verify: Trigger delete from popup, API returns success, conversation gone from list"
+          ],
+          "passes": true
+        },
+        {
+          "id": 5,
+          "name": "Delete Confirmation Dialog",
+          "steps": [
+            "Create confirm dialog component in popup (native HTML)",
+            "Show dialog before calling DELETE_CONVERSATION",
+            "Display conversation title in dialog: 'Delete [title]?'",
+            "Require click 'Confirm Delete' button to proceed",
+            "Verify: Click delete, dialog appears, cancel aborts, confirm deletes"
+          ],
+          "passes": true
+        },
+        {
+          "id": 6,
+          "name": "Backup Conversation Before Delete",
+          "steps": [
+            "Add checkbox 'Backup before delete' in delete dialog (default checked)",
+            "If checked, fetch full conversation detail first",
+            "Save to chrome.storage.local with key 'backup_{id}'",
+            "Add 'View Backups' section in popup",
+            "Verify: Delete with backup checked, then find conversation in backups"
+          ],
+          "passes": false
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "name": "Sprint 2: UI Polish & Publishing",
+      "goal": "Professional UI, complete error handling, Chrome Web Store ready",
+      "gate": "Manual QA complete, all edge cases handled",
+      "features": [
+        {
+          "id": 1,
+          "name": "Session Buddy Style List UI",
+          "steps": [
+            "Create popup.css with clean list styling: hover states, selection highlight",
+            "Add conversation metadata display: title, date, message count",
+            "Implement scrollable list with fixed header",
+            "Add loading skeleton while fetching",
+            "Verify: List looks professional, smooth scrolling, clear visual feedback"
+          ],
+          "passes": false
+        },
+        {
+          "id": 2,
+          "name": "Search and Filter",
+          "steps": [
+            "Add search input at top of popup",
+            "Filter conversations by title (client-side)",
+            "Add date filter: Today, This Week, This Month, All",
+            "Show 'No results' message when empty",
+            "Verify: Type search query, list filters instantly"
+          ],
+          "passes": false
+        },
+        {
+          "id": 3,
+          "name": "Preview Panel",
+          "steps": [
+            "Add collapsible preview panel below list or in side panel",
+            "Show last N messages with user/assistant labels",
+            "Add 'Load more' button to fetch additional messages",
+            "Style messages with appropriate formatting",
+            "Verify: Click conversation, preview shows formatted messages"
+          ],
+          "passes": false
+        },
+        {
+          "id": 4,
+          "name": "Comprehensive Error Handling",
+          "steps": [
+            "Handle 401 Unauthorized: show 'Please refresh ChatGPT page' message",
+            "Handle network errors: show retry button",
+            "Handle rate limiting: show wait message with countdown",
+            "Handle empty state: show helpful 'No conversations' message",
+            "Verify: Simulate each error, appropriate message shown"
+          ],
+          "passes": false
+        },
+        {
+          "id": 5,
+          "name": "Chrome Web Store Assets",
+          "steps": [
+            "Create icon-16.png, icon-48.png, icon-128.png",
+            "Write store description and screenshots prep",
+            "Add _locales/en/messages.json for i18n",
+            "Update manifest.json with complete metadata",
+            "Verify: Run npm run build, package ready for upload"
+          ],
+          "passes": false
+        }
+      ]
+    }
+  ],
+  "_meta": {
+    "methodology": "Ralph",
+    "version": "1.0",
+    "current_sprint": 0,
+    "current_feature": 1
+  }
+}
