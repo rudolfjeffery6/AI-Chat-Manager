@@ -166,7 +166,7 @@
             "Add 'View Backups' section in popup",
             "Verify: Delete with backup checked, then find conversation in backups"
           ],
-          "passes": false
+          "passes": true
         }
       ]
     },
@@ -186,7 +186,7 @@
             "Add loading skeleton while fetching",
             "Verify: List looks professional, smooth scrolling, clear visual feedback"
           ],
-          "passes": false
+          "passes": true
         },
         {
           "id": 2,
@@ -198,7 +198,7 @@
             "Show 'No results' message when empty",
             "Verify: Type search query, list filters instantly"
           ],
-          "passes": false
+          "passes": true
         },
         {
           "id": 3,
@@ -210,7 +210,7 @@
             "Style messages with appropriate formatting",
             "Verify: Click conversation, preview shows formatted messages"
           ],
-          "passes": false
+          "passes": true
         },
         {
           "id": 4,

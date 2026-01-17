@@ -18,6 +18,7 @@ let pendingDeleteId: string | null = null
 let pendingDeleteIds: string[] = []
 let currentView: 'conversations' | 'backups' = 'conversations'
 let selectedForDelete: Set<string> = new Set()
+let searchQuery: string = ''
 
 // Loading states - cache-first approach
 let isInitialLoading = false  // Only true when NO cache exists
@@ -489,12 +490,56 @@ function updateBatchDeleteBtn() {
   }
 }
 
+// Filter conversations by search query
+function filterConversations(conversations: Conversation[], query: string): Conversation[] {
+  if (!query.trim()) return conversations
+  const lowerQuery = query.toLowerCase().trim()
+  return conversations.filter(conv => {
+    const title = (conv.title || '').toLowerCase()
+    const snippet = (conv.snippet || '').toLowerCase()
+    return title.includes(lowerQuery) || snippet.includes(lowerQuery)
+  })
+}
+
+// Render search box
+function renderSearchBox(): string {
+  return `
+    <div class="search-box">
+      <span class="search-icon">🔍</span>
+      <input type="text" id="searchInput" class="search-input" placeholder="Search conversations..." value="${escapeHtml(searchQuery)}">
+      <button id="clearSearchBtn" class="clear-search-btn ${searchQuery ? '' : 'hidden'}" title="Clear">×</button>
+    </div>
+  `
+}
+
+// Attach search handlers
+function attachSearchHandlers() {
+  const searchInput = document.getElementById('searchInput') as HTMLInputElement
+  const clearBtn = document.getElementById('clearSearchBtn') as HTMLButtonElement
+
+  searchInput?.addEventListener('input', () => {
+    searchQuery = searchInput.value
+    clearBtn?.classList.toggle('hidden', !searchQuery)
+    renderConversationList(cachedConversations)
+  })
+
+  clearBtn?.addEventListener('click', () => {
+    searchQuery = ''
+    if (searchInput) searchInput.value = ''
+    clearBtn.classList.add('hidden')
+    renderConversationList(cachedConversations)
+  })
+}
+
 function renderConversationList(conversations: Conversation[]) {
   // Don't clear selectedForDelete if just re-rendering after delete
   const preserveSelection = deletingIds.size > 0
   if (!preserveSelection) {
     selectedForDelete.clear()
   }
+
+  // Filter by search query
+  const filteredConversations = filterConversations(conversations, searchQuery)
 
   // Sync status bar
   const syncStatusHtml = `
@@ -504,6 +549,7 @@ function renderConversationList(conversations: Conversation[]) {
     </div>
   `
 
+  // No conversations at all
   if (conversations.length === 0) {
     contentDiv.innerHTML = `
       ${renderTabs()}
@@ -530,7 +576,40 @@ function renderConversationList(conversations: Conversation[]) {
     return
   }
 
-  const listHtml = conversations.map(conv => {
+  // Has conversations but search returned no results
+  if (filteredConversations.length === 0 && searchQuery) {
+    contentDiv.innerHTML = `
+      ${renderTabs()}
+      <div class="main-layout">
+        <div class="left-panel">
+          ${syncStatusHtml}
+          ${renderSearchBox()}
+          <div class="no-results">
+            <div class="no-results-icon">🔍</div>
+            <div class="no-results-text">No conversations match "${escapeHtml(searchQuery)}"</div>
+            <div class="no-results-hint">Try a different search term</div>
+          </div>
+        </div>
+        <div class="right-panel">
+          <div class="right-panel-header">Preview</div>
+          <div class="right-panel-content">
+            <div id="preview" class="preview">
+              <div class="preview-empty">
+                <div class="preview-empty-icon">💬</div>
+                <div>Click a conversation to preview</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `
+    attachTabHandlers()
+    attachSyncHandler()
+    attachSearchHandlers()
+    return
+  }
+
+  const listHtml = filteredConversations.map(conv => {
     const isDeleting = deletingIds.has(conv.id)
     const snippetText = conv.snippet || ''
     const countText = conv.messageCount ? `${conv.messageCount} msgs` : ''
@@ -551,11 +630,18 @@ function renderConversationList(conversations: Conversation[]) {
     </div>
   `}).join('')
 
+  // Show result count when searching
+  const resultCountHtml = searchQuery
+    ? `<div class="search-result-count">${filteredConversations.length} of ${conversations.length} conversations</div>`
+    : ''
+
   contentDiv.innerHTML = `
     ${renderTabs()}
     <div class="main-layout">
       <div class="left-panel">
         ${syncStatusHtml}
+        ${renderSearchBox()}
+        ${resultCountHtml}
         <div class="batch-actions">
           <label class="select-all-label">
             <input type="checkbox" id="selectAllCheckbox">
@@ -581,6 +667,7 @@ function renderConversationList(conversations: Conversation[]) {
 
   attachTabHandlers()
   attachSyncHandler()
+  attachSearchHandlers()
 
   // Select all checkbox
   const selectAllCheckbox = document.getElementById('selectAllCheckbox') as HTMLInputElement
