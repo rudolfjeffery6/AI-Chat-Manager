@@ -25,6 +25,15 @@ let isInitialLoading = false  // Only true when NO cache exists
 let isRefreshing = false      // True during background refresh
 let deletingIds: Set<string> = new Set()
 
+// Pagination states
+const DEFAULT_LIMIT = 50  // Default conversations per load
+let totalConversations: number | null = null  // Total count from server
+let hasMore = false  // Whether more conversations exist
+let isLoadingMore = false  // Loading more in progress
+let isLoadingAll = false  // Load all in progress
+let loadAllCancelled = false  // User cancelled load all
+let loadingProgress = { current: 0, total: 0 }  // Progress for load all
+
 // Local cache
 let cachedConversations: Conversation[] = []
 let lastSyncAt: number | null = null
@@ -510,9 +519,11 @@ async function silentRefresh() {
   updateSyncStatus()
 
   try {
-    const response = await chrome.runtime.sendMessage({ type: 'GET_CONVERSATIONS', limit: 20 })
+    const response = await chrome.runtime.sendMessage({ type: 'GET_CONVERSATIONS', limit: DEFAULT_LIMIT })
     if (!response.error && response.data?.items) {
       cachedConversations = response.data.items
+      totalConversations = response.data.total ?? null
+      hasMore = response.data.has_more ?? false
       await saveCache()
       // Only re-render if no deletion in progress
       if (deletingIds.size === 0) {
@@ -525,6 +536,182 @@ async function silentRefresh() {
     isRefreshing = false
     updateSyncStatus()
   }
+}
+
+// Load more conversations (append to existing)
+async function loadMoreConversations() {
+  if (isLoadingMore || isLoadingAll) return
+
+  isLoadingMore = true
+  updateLoadMoreButton()
+
+  try {
+    const offset = cachedConversations.length
+    const response = await chrome.runtime.sendMessage({
+      type: 'GET_CONVERSATIONS',
+      offset,
+      limit: DEFAULT_LIMIT
+    })
+
+    if (!response.error && response.data?.items) {
+      // Append new items
+      cachedConversations = [...cachedConversations, ...response.data.items]
+      totalConversations = response.data.total ?? totalConversations
+      hasMore = response.data.has_more ?? false
+      await saveCache()
+      renderConversationList(cachedConversations)
+    } else if (response.error) {
+      showErrorWithAction(response.error)
+    }
+  } catch (err) {
+    showErrorWithAction(String(err))
+  } finally {
+    isLoadingMore = false
+    updateLoadMoreButton()
+  }
+}
+
+// Load all conversations with progress
+async function loadAllConversations() {
+  if (isLoadingMore || isLoadingAll) return
+
+  isLoadingAll = true
+  loadAllCancelled = false
+  loadingProgress = { current: cachedConversations.length, total: totalConversations || 0 }
+  updateLoadAllProgress()
+
+  try {
+    while (hasMore && !loadAllCancelled) {
+      const offset = cachedConversations.length
+      const response = await chrome.runtime.sendMessage({
+        type: 'GET_CONVERSATIONS',
+        offset,
+        limit: DEFAULT_LIMIT
+      })
+
+      if (loadAllCancelled) break
+
+      if (!response.error && response.data?.items) {
+        cachedConversations = [...cachedConversations, ...response.data.items]
+        totalConversations = response.data.total ?? totalConversations
+        hasMore = response.data.has_more ?? false
+        loadingProgress = {
+          current: cachedConversations.length,
+          total: totalConversations || cachedConversations.length
+        }
+        updateLoadAllProgress()
+        await saveCache()
+      } else if (response.error) {
+        showErrorWithAction(response.error)
+        break
+      }
+    }
+
+    // Final render
+    renderConversationList(cachedConversations)
+  } catch (err) {
+    showErrorWithAction(String(err))
+  } finally {
+    isLoadingAll = false
+    loadAllCancelled = false
+    updateLoadMoreButton()
+  }
+}
+
+// Cancel load all operation
+function cancelLoadAll() {
+  loadAllCancelled = true
+}
+
+// Update Load More button state
+function updateLoadMoreButton() {
+  const loadMoreBtn = document.getElementById('loadMoreBtn') as HTMLButtonElement
+  const loadAllBtn = document.getElementById('loadAllBtn') as HTMLButtonElement
+
+  if (loadMoreBtn) {
+    loadMoreBtn.disabled = isLoadingMore || isLoadingAll
+    loadMoreBtn.textContent = isLoadingMore ? 'Loading...' : 'Load More'
+  }
+
+  if (loadAllBtn) {
+    loadAllBtn.disabled = isLoadingMore || isLoadingAll
+  }
+}
+
+// Update Load All progress display
+function updateLoadAllProgress() {
+  const loadAllBtn = document.getElementById('loadAllBtn') as HTMLButtonElement
+  const progressDiv = document.getElementById('loadAllProgress')
+  const cancelBtn = document.getElementById('cancelLoadAllBtn')
+
+  if (isLoadingAll) {
+    if (loadAllBtn) {
+      loadAllBtn.disabled = true
+      loadAllBtn.classList.add('hidden')
+    }
+    if (progressDiv) {
+      const percent = loadingProgress.total > 0
+        ? Math.round((loadingProgress.current / loadingProgress.total) * 100)
+        : 0
+      progressDiv.innerHTML = `
+        <span class="progress-text">Loading ${loadingProgress.current} / ${loadingProgress.total} (${percent}%)</span>
+        <div class="progress-bar">
+          <div class="progress-fill" style="width: ${percent}%"></div>
+        </div>
+      `
+      progressDiv.classList.remove('hidden')
+    }
+    if (cancelBtn) {
+      cancelBtn.classList.remove('hidden')
+    }
+  } else {
+    if (loadAllBtn) {
+      loadAllBtn.classList.remove('hidden')
+      loadAllBtn.disabled = false
+    }
+    if (progressDiv) {
+      progressDiv.classList.add('hidden')
+    }
+    if (cancelBtn) {
+      cancelBtn.classList.add('hidden')
+    }
+  }
+}
+
+// Render Load More section
+function renderLoadMoreSection(): string {
+  if (!hasMore) return ''
+
+  const loadedText = totalConversations
+    ? `Showing ${cachedConversations.length} of ${totalConversations} conversations`
+    : `Loaded ${cachedConversations.length} conversations`
+
+  return `
+    <div class="load-more-section">
+      <div class="load-more-info">${loadedText}</div>
+      <div class="load-more-actions">
+        <button id="loadMoreBtn" class="load-more-btn" ${isLoadingMore || isLoadingAll ? 'disabled' : ''}>
+          ${isLoadingMore ? 'Loading...' : 'Load More'}
+        </button>
+        <button id="loadAllBtn" class="load-all-btn ${isLoadingAll ? 'hidden' : ''}" ${isLoadingMore || isLoadingAll ? 'disabled' : ''}>
+          Load All
+        </button>
+        <div id="loadAllProgress" class="load-all-progress hidden"></div>
+        <button id="cancelLoadAllBtn" class="cancel-load-btn hidden">Cancel</button>
+      </div>
+    </div>
+  `
+}
+
+// Attach Load More handlers
+function attachLoadMoreHandlers() {
+  const loadMoreBtn = document.getElementById('loadMoreBtn')
+  const loadAllBtn = document.getElementById('loadAllBtn')
+  const cancelBtn = document.getElementById('cancelLoadAllBtn')
+
+  loadMoreBtn?.addEventListener('click', loadMoreConversations)
+  loadAllBtn?.addEventListener('click', loadAllConversations)
+  cancelBtn?.addEventListener('click', cancelLoadAll)
 }
 
 async function checkTokenStatus(): Promise<boolean> {
@@ -707,10 +894,13 @@ function updateListItems() {
 
   const filteredConversations = filterConversations(cachedConversations, searchQuery)
 
-  // Update result count
+  // Update result count with partial data warning
   if (resultCountEl) {
     if (searchQuery) {
-      resultCountEl.textContent = `${filteredConversations.length} of ${cachedConversations.length} conversations`
+      const partialWarning = hasMore
+        ? ` (searching ${cachedConversations.length} of ${totalConversations || '?'} loaded)`
+        : ''
+      resultCountEl.innerHTML = `${filteredConversations.length} results<span class="partial-data-hint">${partialWarning}</span>`
       resultCountEl.classList.remove('hidden')
     } else {
       resultCountEl.classList.add('hidden')
@@ -905,8 +1095,11 @@ function renderConversationList(conversations: Conversation[]) {
     </div>
   `}).join('')
 
-  // Result count (always render, toggle visibility via class)
-  const resultCountHtml = `<div class="search-result-count ${searchQuery ? '' : 'hidden'}">${searchQuery ? `${filteredConversations.length} of ${conversations.length} conversations` : ''}</div>`
+  // Result count with partial data warning
+  const partialWarning = hasMore && searchQuery
+    ? ` <span class="partial-data-hint">(searching ${conversations.length} of ${totalConversations || '?'} loaded)</span>`
+    : ''
+  const resultCountHtml = `<div class="search-result-count ${searchQuery ? '' : 'hidden'}">${searchQuery ? `${filteredConversations.length} results${partialWarning}` : ''}</div>`
 
   contentDiv.innerHTML = `
     ${renderTabs()}
@@ -923,6 +1116,7 @@ function renderConversationList(conversations: Conversation[]) {
           <button id="batchDeleteBtn" class="batch-delete-btn" disabled>Delete</button>
         </div>
         <div class="conversation-list">${listHtml}</div>
+        ${renderLoadMoreSection()}
       </div>
       <div class="right-panel">
         <div class="right-panel-header">Preview</div>
@@ -970,6 +1164,9 @@ function renderConversationList(conversations: Conversation[]) {
 
   // Attach list item handlers (checkboxes, preview, delete buttons)
   attachListItemHandlers()
+
+  // Attach Load More handlers
+  attachLoadMoreHandlers()
 }
 
 function attachSyncHandler() {
@@ -1095,7 +1292,7 @@ async function loadConversations() {
   }
 
   try {
-    const response = await chrome.runtime.sendMessage({ type: 'GET_CONVERSATIONS', limit: 20 })
+    const response = await chrome.runtime.sendMessage({ type: 'GET_CONVERSATIONS', limit: DEFAULT_LIMIT })
     if (response.error) {
       showErrorWithAction(response.error)
       // Still render cached data if available
@@ -1132,6 +1329,8 @@ async function loadConversations() {
     }
 
     cachedConversations = response.data.items
+    totalConversations = response.data.total ?? null
+    hasMore = response.data.has_more ?? false
     await saveCache()
     isInitialLoading = false
     renderConversationList(cachedConversations)
