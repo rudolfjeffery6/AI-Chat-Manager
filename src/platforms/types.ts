@@ -114,3 +114,16 @@ export function getSyncErrorKey(platform: PlatformType): string {
 export function getBackupKey(platform: PlatformType, conversationId: string): string {
   return `${platform}_backup_${conversationId}`
 }
+
+export function getPreviewCacheKey(platform: PlatformType, conversationId: string): string {
+  return `${platform}_preview_${conversationId}`
+}
+
+// Preview cache structure
+export interface PreviewCache {
+  messages: UnifiedMessage[]
+  cachedAt: number
+}
+
+// Preview cache expiry (24 hours)
+export const PREVIEW_CACHE_EXPIRY_MS = 24 * 60 * 60 * 1000

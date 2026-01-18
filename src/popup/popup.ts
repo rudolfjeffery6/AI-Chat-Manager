@@ -8,7 +8,9 @@ import { getAllPlatforms } from '../platforms/registry'
 import {
   getCacheKey,
   getSyncProgressKey,
-  getSyncErrorKey
+  getSyncErrorKey,
+  getPreviewCacheKey,
+  PREVIEW_CACHE_EXPIRY_MS
 } from '../platforms/types'
 import type {
   PlatformType,
@@ -16,7 +18,8 @@ import type {
   PlatformCache,
   SyncProgress,
   UnifiedConversation,
-  UnifiedMessage
+  UnifiedMessage,
+  PreviewCache
 } from '../platforms/types'
 
 logger.log('popup loaded')
@@ -626,6 +629,60 @@ function renderPreview(messages: UnifiedMessage[], conversationId: string, title
   `
 }
 
+/**
+ * Check if preview cache is valid (within 24 hours)
+ */
+async function getValidPreviewCache(conversationId: string): Promise<UnifiedMessage[] | null> {
+  const cacheKey = getPreviewCacheKey(currentPlatform, conversationId)
+  return new Promise(resolve => {
+    chrome.storage.local.get([cacheKey], result => {
+      const cache = result[cacheKey] as PreviewCache | undefined
+      if (cache?.messages && cache.cachedAt) {
+        const age = Date.now() - cache.cachedAt
+        if (age < PREVIEW_CACHE_EXPIRY_MS) {
+          resolve(cache.messages)
+          return
+        }
+      }
+      resolve(null)
+    })
+  })
+}
+
+/**
+ * Save preview to cache
+ */
+async function savePreviewCache(conversationId: string, messages: UnifiedMessage[]): Promise<void> {
+  const cacheKey = getPreviewCacheKey(currentPlatform, conversationId)
+  const cache: PreviewCache = {
+    messages,
+    cachedAt: Date.now()
+  }
+  await chrome.storage.local.set({ [cacheKey]: cache })
+}
+
+/**
+ * Render summary as initial preview content
+ */
+function renderSummaryPreview(summary: string, conversationId: string, title: string): string {
+  const platform = platforms.find(p => p.name === currentPlatform)
+  return `
+    <div class="preview-messages preview-summary">
+      <div class="summary-content">
+        <div class="summary-label">Summary</div>
+        <div class="summary-text">${escapeHtml(summary)}</div>
+      </div>
+      <div class="loading-overlay">
+        <span class="spinner-small"></span>
+        <span>Loading full conversation...</span>
+      </div>
+    </div>
+    <div class="preview-actions">
+      <button class="delete-btn" data-id="${conversationId}" data-title="${escapeHtml(title)}">Delete Conversation</button>
+    </div>
+  `
+}
+
 async function showConversationPreview(conversationId: string, title: string) {
   selectedConversationId = conversationId
 
@@ -636,8 +693,27 @@ async function showConversationPreview(conversationId: string, title: string) {
   const previewDiv = document.getElementById('preview')
   if (!previewDiv) return
 
-  previewDiv.innerHTML = '<p class="loading">Loading preview...</p>'
+  const conv = cachedConversations.find(c => c.id === conversationId)
+  const summary = conv?.summary
 
+  // Step 1: Show summary immediately if available (instant feedback)
+  if (summary) {
+    previewDiv.innerHTML = renderSummaryPreview(summary, conversationId, title)
+    attachPreviewDeleteHandler(previewDiv)
+  } else {
+    previewDiv.innerHTML = '<p class="loading">Loading preview...</p>'
+  }
+
+  // Step 2: Check preview cache (24h validity)
+  const cachedMessages = await getValidPreviewCache(conversationId)
+  if (cachedMessages) {
+    // Cache hit - show immediately
+    logger.log(`[preview] Cache hit for ${conversationId}`)
+    showFullPreview(previewDiv, cachedMessages, conversationId, title, conv)
+    return
+  }
+
+  // Step 3: Fetch from API
   try {
     const response = await chrome.runtime.sendMessage({
       type: 'GET_CONVERSATION_DETAIL',
@@ -646,31 +722,83 @@ async function showConversationPreview(conversationId: string, title: string) {
     })
 
     if (response.error) {
-      previewDiv.innerHTML = `<p class="error-text">${parseError(response.error)}</p>`
+      // If we have summary, keep showing it as fallback
+      if (summary) {
+        const overlay = previewDiv.querySelector('.loading-overlay')
+        if (overlay) {
+          overlay.innerHTML = `<span class="error-icon">⚠</span><span>${parseError(response.error)}</span>`
+          overlay.classList.add('error')
+        }
+      } else {
+        previewDiv.innerHTML = `<p class="error-text">${parseError(response.error)}</p>`
+      }
       return
     }
 
     const messages = response.data.messages
-    const snippet = extractSnippet(messages)
-    const conv = cachedConversations.find(c => c.id === conversationId)
-    if (conv) {
-      conv.snippet = snippet
-      conv.messageCount = messages.length
-      updateConversationSnippet(conversationId, snippet, messages.length)
-    }
 
+    // Save to cache for next time
+    await savePreviewCache(conversationId, messages)
+
+    // Show full preview with smooth transition
+    showFullPreview(previewDiv, messages, conversationId, title, conv)
+
+  } catch (err) {
+    if (summary) {
+      const overlay = previewDiv.querySelector('.loading-overlay')
+      if (overlay) {
+        overlay.innerHTML = `<span class="error-icon">⚠</span><span>Failed to load</span>`
+        overlay.classList.add('error')
+      }
+    } else {
+      previewDiv.innerHTML = `<p class="error-text">Failed to load preview</p>`
+    }
+  }
+}
+
+/**
+ * Show full preview with smooth transition
+ */
+function showFullPreview(
+  previewDiv: HTMLElement,
+  messages: UnifiedMessage[],
+  conversationId: string,
+  title: string,
+  conv: UnifiedConversation | undefined
+) {
+  const snippet = extractSnippet(messages)
+  if (conv) {
+    conv.snippet = snippet
+    conv.messageCount = messages.length
+    updateConversationSnippet(conversationId, snippet, messages.length)
+  }
+
+  // Add fade-in class for smooth transition
+  previewDiv.classList.add('preview-transitioning')
+
+  // Small delay for smooth visual transition
+  requestAnimationFrame(() => {
     previewDiv.innerHTML = renderPreview(messages, conversationId, title)
+    attachPreviewDeleteHandler(previewDiv)
 
-    const deleteBtn = previewDiv.querySelector('.delete-btn')
-    if (deleteBtn) {
-      deleteBtn.addEventListener('click', () => {
-        const id = deleteBtn.getAttribute('data-id')
-        const btnTitle = deleteBtn.getAttribute('data-title') || 'Untitled'
-        if (id) showConfirmDialog(id, btnTitle)
-      })
-    }
-  } catch {
-    previewDiv.innerHTML = `<p class="error-text">Failed to load preview</p>`
+    // Remove transition class after animation
+    setTimeout(() => {
+      previewDiv.classList.remove('preview-transitioning')
+    }, 150)
+  })
+}
+
+/**
+ * Attach delete button handler in preview
+ */
+function attachPreviewDeleteHandler(previewDiv: HTMLElement) {
+  const deleteBtn = previewDiv.querySelector('.delete-btn')
+  if (deleteBtn) {
+    deleteBtn.addEventListener('click', () => {
+      const id = deleteBtn.getAttribute('data-id')
+      const btnTitle = deleteBtn.getAttribute('data-title') || 'Untitled'
+      if (id) showConfirmDialog(id, btnTitle)
+    })
   }
 }
 
