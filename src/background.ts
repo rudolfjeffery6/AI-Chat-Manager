@@ -124,7 +124,8 @@ const pendingDeletes: Record<PlatformType, Set<string>> = {
 // Sync constants
 const SYNC_BATCH_SIZE = 50
 const SYNC_DELAY_MS = 300
-const CACHE_FRESHNESS_MS = 5 * 60 * 1000 // 5 minutes
+// Cache is considered fresh for 24 hours - auto-sync handles incremental updates
+const CACHE_FRESHNESS_MS = 24 * 60 * 60 * 1000 // 24 hours
 
 // Helper function for delay
 function sleep(ms: number): Promise<void> {

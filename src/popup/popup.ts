@@ -1488,10 +1488,17 @@ async function init() {
   logger.log('init: hasToken =', hasToken)
 
   if (hasToken) {
-    logger.log('init: triggering background sync')
-    triggerSync()
-    // Start auto-sync for new conversation detection
+    // Start auto-sync for incremental updates (checks every 30s)
     startAutoSync()
+
+    // Only trigger full sync if no cached data exists
+    // Otherwise, rely on auto-sync for incremental updates
+    if (!hasCache || cachedConversations.length === 0) {
+      logger.log('init: no cache, triggering full sync')
+      triggerSync()
+    } else {
+      logger.log('init: cache exists, relying on auto-sync for updates')
+    }
   } else {
     if (!hasCache) {
       const platform = platforms.find(p => p.name === currentPlatform)
