@@ -94,6 +94,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   logger.log('Content received:', message)
 
   try {
+    // Diagnostics ping
+    if (message.type === 'PING') {
+      sendResponse({
+        type: 'PONG',
+        time: Date.now(),
+        url: location.href,
+        platform: currentPlatform
+      })
+      return true
+    }
+
     if (message.type === 'GET_PAGE_INFO') {
       sendResponse({
         url: location.href,

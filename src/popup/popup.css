@@ -1295,3 +1295,210 @@ h1 {
   height: 18px;
   color: var(--tab-color);
 }
+
+/* -----------------------------
+   Diagnostics Panel
+   ----------------------------- */
+.diagnostics-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+  padding: var(--space-md);
+  height: 100%;
+  overflow-y: auto;
+}
+
+.diag-section {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-md);
+}
+
+.diag-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: var(--space-sm);
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.diag-log-count {
+  font-weight: 400;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.diag-info-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--space-sm);
+}
+
+.diag-info-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.diag-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.diag-value {
+  font-size: 13px;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.status-connected {
+  color: var(--green);
+}
+
+.status-disconnected {
+  color: var(--red);
+}
+
+.diag-actions {
+  display: flex;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-sm);
+}
+
+.diag-btn {
+  padding: var(--space-sm) var(--space-md);
+  font-size: 13px;
+  font-weight: 500;
+  font-family: var(--font-sans);
+  border: 1px solid var(--orange);
+  border-radius: var(--radius-md);
+  background: var(--orange);
+  color: white;
+  cursor: pointer;
+  transition: all var(--transition);
+}
+
+.diag-btn:hover {
+  background: var(--orange-dark);
+  border-color: var(--orange-dark);
+}
+
+.diag-btn-secondary {
+  background: var(--bg-secondary);
+  border-color: var(--border);
+  color: var(--text-primary);
+}
+
+.diag-btn-secondary:hover {
+  background: var(--bg-card);
+  border-color: var(--orange-light);
+}
+
+.diag-result {
+  min-height: 24px;
+  font-size: 13px;
+  padding: var(--space-xs) 0;
+}
+
+.diag-testing {
+  color: var(--text-muted);
+}
+
+.diag-success {
+  color: var(--green);
+}
+
+.diag-error {
+  color: var(--red);
+}
+
+.diag-logs-section {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 200px;
+}
+
+.diag-logs {
+  flex: 1;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-sm);
+  overflow-y: auto;
+  max-height: 250px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.diag-logs-loading,
+.diag-logs-empty {
+  color: var(--text-muted);
+  text-align: center;
+  padding: var(--space-md);
+  font-family: var(--font-sans);
+  font-size: 13px;
+}
+
+.diag-log-entry {
+  padding: 2px 0;
+  word-break: break-word;
+}
+
+.diag-log-entry.log-info {
+  color: var(--text-secondary);
+}
+
+.diag-log-entry.log-warn {
+  color: var(--orange);
+}
+
+.diag-log-entry.log-error {
+  color: var(--red);
+}
+
+.log-time {
+  color: var(--text-muted);
+}
+
+.log-level {
+  font-weight: 600;
+  margin: 0 4px;
+}
+
+.log-action {
+  color: var(--text-primary);
+}
+
+.log-message {
+  color: var(--text-secondary);
+}
+
+.log-duration {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.diag-log-actions {
+  display: flex;
+  gap: var(--space-sm);
+  margin-top: var(--space-sm);
+}
+
+.diag-copy-status {
+  font-size: 12px;
+  color: var(--green);
+  margin-top: var(--space-xs);
+  opacity: 0;
+  transition: opacity var(--transition);
+}
+
+.diag-copy-status.visible {
+  opacity: 1;
+}

@@ -21,6 +21,20 @@ import type {
   UnifiedMessage,
   PreviewCache
 } from '../platforms/types'
+import { ErrorCode, ErrorMessages } from '../errors'
+
+// Diagnostics types
+interface LogEntry {
+  timestamp: number
+  level: 'INFO' | 'WARN' | 'ERROR'
+  action: string
+  url?: string
+  status?: number
+  duration?: number
+  message?: string
+  stack?: string
+  platform?: string
+}
 
 logger.log('popup loaded')
 
@@ -48,7 +62,7 @@ let platforms: PlatformConfig[] = []
 let selectedConversationId: string | null = null
 let pendingDeleteId: string | null = null
 let pendingDeleteIds: string[] = []
-let currentView: 'conversations' | 'backups' = 'conversations'
+let currentView: 'conversations' | 'backups' | 'diagnostics' = 'conversations'
 let selectedForDelete: Set<string> = new Set()
 let searchQuery: string = ''
 let currentSortOption: SortOption = 'updated'
@@ -505,6 +519,7 @@ function renderViewTabs(): string {
     <div class="view-tabs">
       <button class="view-tab ${currentView === 'conversations' ? 'active' : ''}" data-view="conversations">Conversations</button>
       <button class="view-tab ${currentView === 'backups' ? 'active' : ''}" data-view="backups">Backups</button>
+      <button class="view-tab ${currentView === 'diagnostics' ? 'active' : ''}" data-view="diagnostics">Diagnostics</button>
     </div>
   `
 }
@@ -512,13 +527,15 @@ function renderViewTabs(): string {
 function attachViewTabHandlers() {
   contentDiv.querySelectorAll('.view-tab').forEach(tab => {
     tab.addEventListener('click', () => {
-      const view = tab.getAttribute('data-view') as 'conversations' | 'backups'
+      const view = tab.getAttribute('data-view') as 'conversations' | 'backups' | 'diagnostics'
       if (view && view !== currentView) {
         currentView = view
         if (view === 'conversations') {
           renderConversationList(cachedConversations)
-        } else {
+        } else if (view === 'backups') {
           renderBackupList()
+        } else if (view === 'diagnostics') {
+          renderDiagnosticsPanel()
         }
       }
     })
@@ -1322,6 +1339,299 @@ async function init() {
     }
   }
   logger.log('init: END')
+}
+
+// ==================== Diagnostics Panel ====================
+
+async function getExtensionVersion(): Promise<string> {
+  try {
+    const manifest = chrome.runtime.getManifest()
+    return manifest.version || 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
+function formatLogTime(timestamp: number): string {
+  const date = new Date(timestamp)
+  return date.toLocaleTimeString('en-US', { hour12: false })
+}
+
+function getLogLevelClass(level: string): string {
+  switch (level) {
+    case 'ERROR': return 'log-error'
+    case 'WARN': return 'log-warn'
+    default: return 'log-info'
+  }
+}
+
+function sanitizeLogs(logs: LogEntry[]): LogEntry[] {
+  return logs.map(log => {
+    const sanitized = { ...log }
+    // Sanitize sensitive fields in message
+    if (sanitized.message) {
+      sanitized.message = sanitized.message
+        .replace(/accessToken["\s:=]+[A-Za-z0-9._-]+/gi, 'accessToken: [REDACTED]')
+        .replace(/sessionKey["\s:=]+[A-Za-z0-9._-]+/gi, 'sessionKey: [REDACTED]')
+        .replace(/token["\s:=]+[A-Za-z0-9._-]{20,}/gi, 'token: [REDACTED]')
+        .replace(/user[_-]?id["\s:=]+[A-Za-z0-9-]+/gi, 'userId: [REDACTED]')
+    }
+    // Sanitize conversation IDs (keep first 8 chars)
+    if (sanitized.message) {
+      sanitized.message = sanitized.message.replace(
+        /([a-f0-9]{8})-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/gi,
+        '$1-***'
+      )
+    }
+    if (sanitized.stack) {
+      sanitized.stack = sanitized.stack
+        .replace(/accessToken["\s:=]+[A-Za-z0-9._-]+/gi, 'accessToken: [REDACTED]')
+        .replace(/token["\s:=]+[A-Za-z0-9._-]{20,}/gi, 'token: [REDACTED]')
+    }
+    return sanitized
+  })
+}
+
+async function pingContentScript(): Promise<{ ok: boolean; duration: number; url?: string; error?: string }> {
+  const startTime = Date.now()
+  const timeout = 500
+
+  return new Promise((resolve) => {
+    const timeoutId = setTimeout(() => {
+      resolve({ ok: false, duration: timeout, error: ErrorCode.INJECT_FAILED })
+    }, timeout)
+
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tab = tabs[0]
+      if (!tab?.id) {
+        clearTimeout(timeoutId)
+        resolve({ ok: false, duration: Date.now() - startTime, error: ErrorCode.NO_TAB })
+        return
+      }
+
+      try {
+        const response = await chrome.tabs.sendMessage(tab.id, { type: 'PING' })
+        clearTimeout(timeoutId)
+        if (response?.type === 'PONG') {
+          resolve({
+            ok: true,
+            duration: Date.now() - startTime,
+            url: response.url
+          })
+        } else {
+          resolve({ ok: false, duration: Date.now() - startTime, error: ErrorCode.INJECT_FAILED })
+        }
+      } catch {
+        clearTimeout(timeoutId)
+        resolve({ ok: false, duration: Date.now() - startTime, error: ErrorCode.INJECT_FAILED })
+      }
+    })
+  })
+}
+
+async function probeAPI(): Promise<{ ok: boolean; duration: number; status?: number; total?: number; error?: string }> {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage(
+      { type: 'PROBE', platform: currentPlatform },
+      (response) => {
+        if (response) {
+          resolve(response)
+        } else {
+          resolve({ ok: false, duration: 0, error: ErrorCode.NETWORK_ERROR })
+        }
+      }
+    )
+  })
+}
+
+async function fetchDiagnosticsLogs(): Promise<LogEntry[]> {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: 'GET_LOGS' }, (response) => {
+      resolve(response?.logs || [])
+    })
+  })
+}
+
+async function clearDiagnosticsLogs(): Promise<void> {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: 'CLEAR_LOGS' }, () => resolve())
+  })
+}
+
+function renderDiagnosticsPanel() {
+  const platform = platforms.find(p => p.name === currentPlatform)
+
+  contentDiv.innerHTML = `
+    ${renderPlatformTabs()}
+    ${renderViewTabs()}
+    <div class="diagnostics-panel">
+      <div class="diag-section">
+        <div class="diag-title">System Info</div>
+        <div class="diag-info-grid">
+          <div class="diag-info-item">
+            <span class="diag-label">Version</span>
+            <span class="diag-value" id="diagVersion">Loading...</span>
+          </div>
+          <div class="diag-info-item">
+            <span class="diag-label">Platform</span>
+            <span class="diag-value">${platform?.displayName || currentPlatform}</span>
+          </div>
+          <div class="diag-info-item">
+            <span class="diag-label">Status</span>
+            <span class="diag-value" id="diagStatus">Checking...</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="diag-section">
+        <div class="diag-title">Connection Tests</div>
+        <div class="diag-actions">
+          <button id="pingBtn" class="diag-btn">Ping</button>
+          <button id="probeBtn" class="diag-btn">Probe API</button>
+        </div>
+        <div id="diagResult" class="diag-result"></div>
+      </div>
+
+      <div class="diag-section diag-logs-section">
+        <div class="diag-title">
+          Recent Logs
+          <span class="diag-log-count" id="logCount"></span>
+        </div>
+        <div id="diagLogs" class="diag-logs">
+          <div class="diag-logs-loading">Loading logs...</div>
+        </div>
+        <div class="diag-log-actions">
+          <button id="copyLogsBtn" class="diag-btn diag-btn-secondary">Copy Logs</button>
+          <button id="clearLogsBtn" class="diag-btn diag-btn-secondary">Clear Logs</button>
+        </div>
+        <div id="copyStatus" class="diag-copy-status"></div>
+      </div>
+    </div>
+  `
+
+  attachPlatformTabHandlers()
+  attachViewTabHandlers()
+  attachDiagnosticsHandlers()
+  loadDiagnosticsData()
+}
+
+async function loadDiagnosticsData() {
+  // Load version
+  const version = await getExtensionVersion()
+  const versionEl = document.getElementById('diagVersion')
+  if (versionEl) versionEl.textContent = version
+
+  // Check connection status
+  const pingResult = await pingContentScript()
+  const statusEl = document.getElementById('diagStatus')
+  if (statusEl) {
+    if (pingResult.ok) {
+      statusEl.innerHTML = '<span class="status-connected">Connected</span>'
+    } else {
+      statusEl.innerHTML = '<span class="status-disconnected">Disconnected</span>'
+    }
+  }
+
+  // Load logs
+  await refreshDiagnosticsLogs()
+}
+
+async function refreshDiagnosticsLogs() {
+  const logs = await fetchDiagnosticsLogs()
+  const logsEl = document.getElementById('diagLogs')
+  const countEl = document.getElementById('logCount')
+
+  if (countEl) {
+    countEl.textContent = `(${logs.length})`
+  }
+
+  if (logsEl) {
+    if (logs.length === 0) {
+      logsEl.innerHTML = '<div class="diag-logs-empty">No logs yet</div>'
+    } else {
+      // Show newest first
+      const reversedLogs = [...logs].reverse()
+      logsEl.innerHTML = reversedLogs.map(log => `
+        <div class="diag-log-entry ${getLogLevelClass(log.level)}">
+          <span class="log-time">[${formatLogTime(log.timestamp)}]</span>
+          <span class="log-level">[${log.level}]</span>
+          <span class="log-action">${escapeHtml(log.action)}</span>
+          ${log.message ? `<span class="log-message">- ${escapeHtml(log.message)}</span>` : ''}
+          ${log.duration ? `<span class="log-duration">(${log.duration}ms)</span>` : ''}
+        </div>
+      `).join('')
+    }
+  }
+}
+
+function attachDiagnosticsHandlers() {
+  const pingBtn = document.getElementById('pingBtn')
+  const probeBtn = document.getElementById('probeBtn')
+  const copyLogsBtn = document.getElementById('copyLogsBtn')
+  const clearLogsBtn = document.getElementById('clearLogsBtn')
+  const resultEl = document.getElementById('diagResult')
+
+  pingBtn?.addEventListener('click', async () => {
+    if (resultEl) resultEl.innerHTML = '<span class="diag-testing">Testing...</span>'
+    const result = await pingContentScript()
+
+    if (result.ok) {
+      if (resultEl) {
+        const hostname = result.url ? new URL(result.url).hostname : 'unknown'
+        resultEl.innerHTML = `<span class="diag-success">✓ Ping OK (${result.duration}ms) - URL: ${hostname}</span>`
+      }
+    } else {
+      const errorInfo = ErrorMessages[result.error as ErrorCode] || { title: result.error }
+      if (resultEl) {
+        resultEl.innerHTML = `<span class="diag-error">✗ Ping Failed - ${errorInfo.title}</span>`
+      }
+    }
+  })
+
+  probeBtn?.addEventListener('click', async () => {
+    if (resultEl) resultEl.innerHTML = '<span class="diag-testing">Testing API...</span>'
+    const result = await probeAPI()
+
+    if (result.ok) {
+      if (resultEl) {
+        resultEl.innerHTML = `<span class="diag-success">✓ API OK (${result.duration}ms) - Status: ${result.status}</span>`
+      }
+    } else {
+      const errorInfo = ErrorMessages[result.error as ErrorCode] || { title: result.error }
+      const statusText = result.status ? ` - Status: ${result.status}` : ''
+      if (resultEl) {
+        resultEl.innerHTML = `<span class="diag-error">✗ API Failed${statusText} - ${errorInfo.title}</span>`
+      }
+    }
+
+    // Refresh logs after probe
+    await refreshDiagnosticsLogs()
+  })
+
+  copyLogsBtn?.addEventListener('click', async () => {
+    const logs = await fetchDiagnosticsLogs()
+    const sanitized = sanitizeLogs(logs)
+    const json = JSON.stringify(sanitized, null, 2)
+
+    try {
+      await navigator.clipboard.writeText(json)
+      const statusEl = document.getElementById('copyStatus')
+      if (statusEl) {
+        statusEl.textContent = 'Copied!'
+        statusEl.classList.add('visible')
+        setTimeout(() => {
+          statusEl.classList.remove('visible')
+        }, 2000)
+      }
+    } catch (err) {
+      logger.error('Failed to copy logs:', err)
+    }
+  })
+
+  clearLogsBtn?.addEventListener('click', async () => {
+    await clearDiagnosticsLogs()
+    await refreshDiagnosticsLogs()
+  })
 }
 
 init()

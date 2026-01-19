@@ -16,8 +16,64 @@ import type {
   PlatformCache,
   UnifiedConversation
 } from './platforms/types'
+import { ErrorCode } from './errors'
 
 logger.log('background loaded')
+
+// ==================== Diagnostics Logging System ====================
+
+export interface LogEntry {
+  timestamp: number
+  level: 'INFO' | 'WARN' | 'ERROR'
+  action: string
+  url?: string
+  status?: number
+  duration?: number
+  message?: string
+  stack?: string
+  platform?: string
+}
+
+const DIAGNOSTICS_LOGS_KEY = 'diagnostics_logs'
+const MAX_LOG_ENTRIES = 50
+
+async function getDiagnosticsLogs(): Promise<LogEntry[]> {
+  return new Promise((resolve) => {
+    chrome.storage.local.get([DIAGNOSTICS_LOGS_KEY], (result) => {
+      resolve((result[DIAGNOSTICS_LOGS_KEY] as LogEntry[] | undefined) || [])
+    })
+  })
+}
+
+async function addDiagnosticsLog(entry: Omit<LogEntry, 'timestamp'>): Promise<void> {
+  const logs = await getDiagnosticsLogs()
+  const newEntry: LogEntry = {
+    ...entry,
+    timestamp: Date.now()
+  }
+  logs.push(newEntry)
+  // Ring buffer: keep only last MAX_LOG_ENTRIES
+  while (logs.length > MAX_LOG_ENTRIES) {
+    logs.shift()
+  }
+  await chrome.storage.local.set({ [DIAGNOSTICS_LOGS_KEY]: logs })
+}
+
+async function clearDiagnosticsLogs(): Promise<void> {
+  await chrome.storage.local.set({ [DIAGNOSTICS_LOGS_KEY]: [] })
+}
+
+// Helper to log with diagnostics
+async function diagLog(level: LogEntry['level'], action: string, details?: Partial<LogEntry>): Promise<void> {
+  await addDiagnosticsLog({ level, action, ...details })
+  if (level === 'ERROR') {
+    logger.error(`[DIAG] ${action}`, details?.message || '')
+  } else if (level === 'WARN') {
+    logger.log(`[DIAG] ${action}`, details?.message || '')
+  } else {
+    logger.log(`[DIAG] ${action}`, details?.message || '')
+  }
+}
 
 // Sync state per platform
 const syncState: Record<PlatformType, { inProgress: boolean; aborted: boolean }> = {
@@ -81,6 +137,10 @@ async function startSync(platform: PlatformType, forceRefresh = false) {
   const authResult = await adapter.checkAuth()
   if (!authResult.ok) {
     logger.error(`[${platform}] Auth failed:`, authResult.message)
+    diagLog('WARN', 'Auth check failed', {
+      platform,
+      message: authResult.error || ErrorCode.AUTH_REQUIRED
+    })
     await chrome.storage.local.set({
       [getSyncErrorKey(platform)]: authResult.message || 'Authentication required'
     })
@@ -103,6 +163,7 @@ async function startSync(platform: PlatformType, forceRefresh = false) {
   state.inProgress = true
   state.aborted = false
   logger.log(`[${platform}] Starting background sync`)
+  diagLog('INFO', 'Sync started', { platform })
 
   // Clear previous error
   await chrome.storage.local.remove(getSyncErrorKey(platform))
@@ -144,6 +205,10 @@ async function startSync(platform: PlatformType, forceRefresh = false) {
 
       if (!result.hasMore) {
         logger.log(`[${platform}] Sync complete!`)
+        diagLog('INFO', 'Sync completed', {
+          platform,
+          message: `${allConversations.length} conversations synced`
+        })
         break
       }
 
@@ -156,6 +221,11 @@ async function startSync(platform: PlatformType, forceRefresh = false) {
 
   } catch (err) {
     logger.error(`[${platform}] Sync error:`, err)
+    diagLog('ERROR', 'Sync failed', {
+      platform,
+      message: String(err),
+      stack: err instanceof Error ? err.stack : undefined
+    })
     await chrome.storage.local.set({
       [getSyncErrorKey(platform)]: String(err)
     })
@@ -231,10 +301,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         adapter.setToken(token)
         storeToken(platform, token)
         logger.log(`[${platform}] Token stored`)
+        diagLog('INFO', 'Token received', { platform })
         sendResponse({ success: true })
         // Auto-start sync when token is set
         startSync(platform)
       } else {
+        diagLog('ERROR', 'Token set failed', { platform, message: ErrorCode.NO_TAB })
         sendResponse({ error: 'Platform not found' })
       }
       return true
@@ -421,8 +493,97 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       throw new Error('Test error')
     }
 
+    // === Diagnostics ===
+    if (message.type === 'GET_LOGS') {
+      getDiagnosticsLogs().then(logs => sendResponse({ logs }))
+      return true
+    }
+
+    if (message.type === 'CLEAR_LOGS') {
+      clearDiagnosticsLogs().then(() => {
+        diagLog('INFO', 'Logs cleared')
+        sendResponse({ success: true })
+      })
+      return true
+    }
+
+    if (message.type === 'PROBE') {
+      const platform = (message.platform || 'chatgpt') as PlatformType
+      const adapter = getPlatform(platform)
+      const startTime = Date.now()
+
+      if (!adapter) {
+        diagLog('ERROR', 'Probe failed', {
+          platform,
+          message: ErrorCode.NO_TAB
+        })
+        sendResponse({ ok: false, error: ErrorCode.NO_TAB })
+        return true
+      }
+
+      getStoredToken(platform).then(async token => {
+        if (token) adapter.setToken(token)
+
+        try {
+          // Try to fetch just 1 conversation to test API
+          const result = await adapter.getConversations(0, 1)
+          const duration = Date.now() - startTime
+
+          diagLog('INFO', 'Probe success', {
+            platform,
+            duration,
+            status: 200,
+            message: `API OK - ${result.total} total conversations`
+          })
+
+          sendResponse({
+            ok: true,
+            duration,
+            status: 200,
+            total: result.total
+          })
+        } catch (err) {
+          const duration = Date.now() - startTime
+          const errorMsg = String(err)
+          let errorCode = ErrorCode.NETWORK_ERROR
+          let status = 0
+
+          if (errorMsg.includes('AUTH_REQUIRED') || errorMsg.includes('401')) {
+            errorCode = ErrorCode.AUTH_REQUIRED
+            status = 401
+          } else if (errorMsg.includes('403')) {
+            errorCode = ErrorCode.AUTH_REQUIRED
+            status = 403
+          } else if (errorMsg.includes('429')) {
+            errorCode = ErrorCode.RATE_LIMITED
+            status = 429
+          }
+
+          diagLog('ERROR', 'Probe failed', {
+            platform,
+            duration,
+            status,
+            message: errorCode,
+            stack: err instanceof Error ? err.stack : undefined
+          })
+
+          sendResponse({
+            ok: false,
+            duration,
+            status,
+            error: errorCode
+          })
+        }
+      })
+      return true
+    }
+
   } catch (err) {
     logger.error('Error in message handler:', err)
+    diagLog('ERROR', 'Message handler error', {
+      message: String(err),
+      stack: err instanceof Error ? err.stack : undefined
+    })
     sendResponse({ error: String(err) })
   }
 
