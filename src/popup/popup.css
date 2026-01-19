@@ -1252,4 +1252,5 @@ h1 {
 .platform-icon svg {
   width: 18px;
   height: 18px;
+  color: var(--tab-color);
 }
