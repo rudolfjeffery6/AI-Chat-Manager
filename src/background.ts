@@ -114,6 +114,13 @@ const priorityIndexQueue: Record<PlatformType, string[]> = {
   gemini: []
 }
 
+// Pending deletes - track IDs being deleted to prevent race conditions with sync
+const pendingDeletes: Record<PlatformType, Set<string>> = {
+  chatgpt: new Set(),
+  claude: new Set(),
+  gemini: new Set()
+}
+
 // Sync constants
 const SYNC_BATCH_SIZE = 50
 const SYNC_DELAY_MS = 300
@@ -428,6 +435,11 @@ async function checkForNewConversations(platform: PlatformType): Promise<boolean
     logger.log(`[${platform}] Auto-sync: Skipping, indexing in progress`)
     return false
   }
+  // Skip if there are pending deletes to avoid race conditions
+  if (pendingDeletes[platform].size > 0) {
+    logger.log(`[${platform}] Auto-sync: Skipping, ${pendingDeletes[platform].size} pending deletes`)
+    return false
+  }
 
   const adapter = getPlatform(platform)
   if (!adapter) return false
@@ -447,6 +459,12 @@ async function checkForNewConversations(platform: PlatformType): Promise<boolean
       return false
     }
 
+    // Filter out pending deletes from latest to avoid false positives
+    const pending = pendingDeletes[platform]
+    const filteredLatest = pending.size > 0
+      ? latest.conversations.filter(c => !pending.has(c.id))
+      : latest.conversations
+
     // Get cached conversations
     const cached = await chrome.storage.local.get(getCacheKey(platform))
     const cache = cached[getCacheKey(platform)] as PlatformCache | undefined
@@ -458,13 +476,19 @@ async function checkForNewConversations(platform: PlatformType): Promise<boolean
       return true
     }
 
-    const latestConv = latest.conversations[0]
+    if (filteredLatest.length === 0) {
+      return false
+    }
+
+    const latestConv = filteredLatest[0]
     const cachedConv = cache.conversations[0]
 
     // Check if there's a new conversation or update
     const hasNew = latestConv.id !== cachedConv.id
     const hasUpdate = latestConv.updateTime > cachedConv.updateTime
-    const countChanged = latest.total !== cache.totalCount
+    // Adjust count comparison to account for pending deletes
+    const expectedCount = latest.total - pending.size
+    const countChanged = expectedCount !== cache.totalCount
 
     if (hasNew || hasUpdate || countChanged) {
       logger.log(`[${platform}] Auto-sync: Changes detected (new=${hasNew}, update=${hasUpdate}, count=${countChanged})`)
@@ -608,16 +632,22 @@ async function startSync(platform: PlatformType, forceRefresh = false) {
 
       logger.log(`[${platform}] Fetched ${allConversations.length}/${totalCount}`)
 
+      // Filter out any conversations that are pending deletion to prevent race conditions
+      const pending = pendingDeletes[platform]
+      const filteredConversations = pending.size > 0
+        ? allConversations.filter(c => !pending.has(c.id))
+        : allConversations
+
       // Save progress to storage
       await chrome.storage.local.set({
         [getCacheKey(platform)]: {
-          conversations: allConversations,
-          totalCount,
+          conversations: filteredConversations,
+          totalCount: filteredConversations.length,
           lastSyncTime: Date.now(),
           syncComplete: !result.hasMore
         } as PlatformCache,
         [getSyncProgressKey(platform)]: {
-          loaded: allConversations.length,
+          loaded: filteredConversations.length,
           total: totalCount,
           inProgress: true
         }
@@ -773,22 +803,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'DELETE_CONVERSATION') {
       const platform = (message.platform || 'chatgpt') as PlatformType
       const adapter = getPlatform(platform)
+      const conversationId = message.conversationId as string
 
       if (!adapter) {
         sendResponse({ error: 'Platform not found' })
         return true
       }
 
+      // Add to pending deletes to prevent race conditions with sync
+      pendingDeletes[platform].add(conversationId)
+
       getStoredToken(platform).then(async token => {
         if (token) adapter.setToken(token)
 
         try {
-          await adapter.deleteConversation(message.conversationId)
-          await removeFromCache(platform, message.conversationId)
+          await adapter.deleteConversation(conversationId)
+          await removeFromCache(platform, conversationId)
+          // Also remove from content index
+          const index = await getContentIndex(platform)
+          if (index[conversationId]) {
+            delete index[conversationId]
+            await saveContentIndex(platform, index)
+          }
           sendResponse({ success: true })
         } catch (err) {
           logger.error(`[${platform}] Failed to delete conversation:`, err)
           sendResponse({ error: String(err) })
+        } finally {
+          // Remove from pending deletes after operation completes
+          pendingDeletes[platform].delete(conversationId)
         }
       })
       return true

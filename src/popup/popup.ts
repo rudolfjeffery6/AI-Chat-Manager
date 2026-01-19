@@ -425,6 +425,7 @@ confirmBtn.addEventListener('click', async () => {
   updateDeletingState()
 
   const failedErrors: string[] = []
+  const successfullyDeleted: string[] = []
 
   for (const id of idsToDelete) {
     try {
@@ -436,6 +437,7 @@ confirmBtn.addEventListener('click', async () => {
         })
         if (backupResponse.error) {
           failedErrors.push(`Backup failed: ${parseError(backupResponse.error)}`)
+          deletingIds.delete(id)
           continue
         }
       }
@@ -448,12 +450,45 @@ confirmBtn.addEventListener('click', async () => {
 
       if (response.error) {
         failedErrors.push(parseError(response.error))
+      } else {
+        // Successfully deleted - track for immediate UI update
+        successfullyDeleted.push(id)
       }
     } catch (err) {
       failedErrors.push(parseError(String(err)))
     }
 
     deletingIds.delete(id)
+  }
+
+  // Immediately update local state for successfully deleted conversations
+  if (successfullyDeleted.length > 0) {
+    // Remove from cached conversations
+    cachedConversations = cachedConversations.filter(c => !successfullyDeleted.includes(c.id))
+
+    // Remove from content index
+    successfullyDeleted.forEach(id => {
+      delete contentIndex[id]
+    })
+
+    // Clear preview if showing deleted conversation
+    if (selectedConversationId && successfullyDeleted.includes(selectedConversationId)) {
+      selectedConversationId = null
+      const previewEl = document.getElementById('preview')
+      if (previewEl) {
+        const platform = platforms.find(p => p.name === currentPlatform)
+        previewEl.innerHTML = `
+          <div class="preview-empty">
+            <div class="preview-empty-icon">${platform?.icon || '💬'}</div>
+            <div>Click a conversation to preview</div>
+          </div>
+        `
+      }
+    }
+
+    // Update UI
+    updateListItems()
+    updateSyncStatusBar()
   }
 
   if (failedErrors.length > 0) {
