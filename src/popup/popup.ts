@@ -510,6 +510,9 @@ function attachPlatformTabHandlers() {
 }
 
 async function switchPlatform(platform: PlatformType) {
+  // Stop auto-sync for old platform
+  stopAutoSync()
+
   currentPlatform = platform
   saveCurrentPlatform()
   clearError()
@@ -533,6 +536,8 @@ async function switchPlatform(platform: PlatformType) {
   const hasToken = await checkTokenStatus()
   if (hasToken) {
     triggerSync()
+    // Start auto-sync for new platform
+    startAutoSync()
   }
 }
 
@@ -633,6 +638,16 @@ function updateSyncStatusBar() {
 function triggerSync(forceRefresh = false) {
   logger.log(`[${currentPlatform}] Triggering sync, forceRefresh:`, forceRefresh)
   chrome.runtime.sendMessage({ type: 'START_SYNC', platform: currentPlatform, forceRefresh })
+}
+
+function startAutoSync() {
+  logger.log(`[${currentPlatform}] Starting auto-sync`)
+  chrome.runtime.sendMessage({ type: 'START_AUTO_SYNC', platform: currentPlatform })
+}
+
+function stopAutoSync() {
+  logger.log(`[${currentPlatform}] Stopping auto-sync`)
+  chrome.runtime.sendMessage({ type: 'STOP_AUTO_SYNC', platform: currentPlatform })
 }
 
 function attachSyncButtonHandler() {
@@ -1440,6 +1455,8 @@ async function init() {
   if (hasToken) {
     logger.log('init: triggering background sync')
     triggerSync()
+    // Start auto-sync for new conversation detection
+    startAutoSync()
   } else {
     if (!hasCache) {
       const platform = platforms.find(p => p.name === currentPlatform)
@@ -1769,5 +1786,10 @@ function attachDiagnosticsHandlers() {
     await refreshDiagnosticsLogs()
   })
 }
+
+// Stop auto-sync when popup closes
+window.addEventListener('beforeunload', () => {
+  stopAutoSync()
+})
 
 init()

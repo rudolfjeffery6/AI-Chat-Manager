@@ -94,6 +94,19 @@ const indexState: Record<PlatformType, { inProgress: boolean; aborted: boolean; 
   gemini: { inProgress: false, aborted: false }
 }
 
+// Auto-sync configuration
+const AUTO_SYNC_CONFIG = {
+  interval: 30000,          // Check every 30 seconds
+  checkBatchSize: 10        // Only fetch latest 10 conversations for comparison
+}
+
+// Auto-sync state per platform
+const autoSyncState: Record<PlatformType, { timerId?: ReturnType<typeof setInterval>; active: boolean }> = {
+  chatgpt: { active: false },
+  claude: { active: false },
+  gemini: { active: false }
+}
+
 // Priority queue for indexing (conversation IDs that user previewed)
 const priorityIndexQueue: Record<PlatformType, string[]> = {
   chatgpt: [],
@@ -397,6 +410,125 @@ function stopContentIndexing(platform: PlatformType) {
   }
   state.inProgress = false
   logger.log(`[${platform}] Indexing stopped`)
+}
+
+// ==================== Auto-Sync System ====================
+
+/**
+ * Check for new conversations (incremental check)
+ * Only fetches latest conversations and compares with cache
+ */
+async function checkForNewConversations(platform: PlatformType): Promise<boolean> {
+  // Skip if sync or indexing is already in progress
+  if (syncState[platform].inProgress) {
+    logger.log(`[${platform}] Auto-sync: Skipping, sync already in progress`)
+    return false
+  }
+  if (indexState[platform].inProgress) {
+    logger.log(`[${platform}] Auto-sync: Skipping, indexing in progress`)
+    return false
+  }
+
+  const adapter = getPlatform(platform)
+  if (!adapter) return false
+
+  const storedToken = await getStoredToken(platform)
+  if (!storedToken) {
+    logger.log(`[${platform}] Auto-sync: No token, skipping`)
+    return false
+  }
+  adapter.setToken(storedToken)
+
+  try {
+    // Only fetch latest conversations for comparison
+    const latest = await adapter.getConversations(0, AUTO_SYNC_CONFIG.checkBatchSize)
+
+    if (!latest?.conversations?.length) {
+      return false
+    }
+
+    // Get cached conversations
+    const cached = await chrome.storage.local.get(getCacheKey(platform))
+    const cache = cached[getCacheKey(platform)] as PlatformCache | undefined
+
+    if (!cache?.conversations?.length) {
+      // No cache, need full sync
+      logger.log(`[${platform}] Auto-sync: No cache, triggering full sync`)
+      startSync(platform, true)
+      return true
+    }
+
+    const latestConv = latest.conversations[0]
+    const cachedConv = cache.conversations[0]
+
+    // Check if there's a new conversation or update
+    const hasNew = latestConv.id !== cachedConv.id
+    const hasUpdate = latestConv.updateTime > cachedConv.updateTime
+    const countChanged = latest.total !== cache.totalCount
+
+    if (hasNew || hasUpdate || countChanged) {
+      logger.log(`[${platform}] Auto-sync: Changes detected (new=${hasNew}, update=${hasUpdate}, count=${countChanged})`)
+      diagLog('INFO', 'Auto-sync detected changes', {
+        platform,
+        message: `new=${hasNew}, update=${hasUpdate}, count=${countChanged}`
+      })
+      startSync(platform, true)
+      return true
+    }
+
+    logger.log(`[${platform}] Auto-sync: No changes detected`)
+    return false
+  } catch (err) {
+    logger.error(`[${platform}] Auto-sync check failed:`, err)
+    return false
+  }
+}
+
+/**
+ * Start auto-sync for a platform
+ */
+function startAutoSync(platform: PlatformType) {
+  const state = autoSyncState[platform]
+
+  // Stop existing timer if any
+  stopAutoSync(platform)
+
+  state.active = true
+  logger.log(`[${platform}] Auto-sync started (interval: ${AUTO_SYNC_CONFIG.interval}ms)`)
+
+  // Check immediately
+  checkForNewConversations(platform)
+
+  // Then check periodically
+  state.timerId = setInterval(() => {
+    if (state.active) {
+      checkForNewConversations(platform)
+    }
+  }, AUTO_SYNC_CONFIG.interval)
+}
+
+/**
+ * Stop auto-sync for a platform
+ */
+function stopAutoSync(platform: PlatformType) {
+  const state = autoSyncState[platform]
+
+  if (state.timerId) {
+    clearInterval(state.timerId)
+    state.timerId = undefined
+  }
+  state.active = false
+  logger.log(`[${platform}] Auto-sync stopped`)
+}
+
+/**
+ * Stop all auto-sync timers
+ */
+function stopAllAutoSync() {
+  const platforms: PlatformType[] = ['chatgpt', 'claude', 'gemini']
+  for (const platform of platforms) {
+    stopAutoSync(platform)
+  }
 }
 
 /**
@@ -835,6 +967,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
       }
       sendResponse({ status: 'queued' })
+      return true
+    }
+
+    // === Auto-Sync ===
+    if (message.type === 'START_AUTO_SYNC') {
+      const platform = (message.platform || 'chatgpt') as PlatformType
+      startAutoSync(platform)
+      sendResponse({ status: 'started', active: autoSyncState[platform].active })
+      return true
+    }
+
+    if (message.type === 'STOP_AUTO_SYNC') {
+      const platform = (message.platform || 'chatgpt') as PlatformType
+      stopAutoSync(platform)
+      sendResponse({ status: 'stopped' })
+      return true
+    }
+
+    if (message.type === 'GET_AUTO_SYNC_STATUS') {
+      const platform = (message.platform || 'chatgpt') as PlatformType
+      sendResponse({ active: autoSyncState[platform].active })
       return true
     }
 
