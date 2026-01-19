@@ -5,6 +5,14 @@ A Chrome extension for managing your AI conversations across multiple platforms 
 ![Chrome Extension](https://img.shields.io/badge/Chrome-Extension-green?logo=googlechrome)
 ![Manifest V3](https://img.shields.io/badge/Manifest-V3-blue)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.3-blue?logo=typescript)
+![Version](https://img.shields.io/badge/version-2.0.0-orange)
+
+## Screenshots
+
+<!-- Screenshots will be added here -->
+| ChatGPT | Claude |
+|---------|--------|
+| *Coming soon* | *Coming soon* |
 
 ## Supported Platforms
 
@@ -19,11 +27,12 @@ A Chrome extension for managing your AI conversations across multiple platforms 
 - 🌐 **Multi-Platform** - Manage ChatGPT and Claude conversations in one place
 - 📋 **View Conversations** - Browse all your conversations in a clean dual-panel UI
 - 🔍 **Search** - Real-time search by title or content
-- 👁️ **Preview** - View conversation messages without leaving the popup
+- 👁️ **Preview** - View conversation messages with 24-hour cache optimization
 - 🗑️ **Delete** - Single or batch delete with confirmation dialog
 - 💾 **Backup** - Optional backup before deletion
 - 🔄 **Background Sync** - Sync continues even when popup is closed
 - ⚡ **Instant Load** - Local caching for instant popup display
+- 🔀 **Platform Tabs** - Quick switch between ChatGPT and Claude
 
 ## Installation
 
@@ -31,7 +40,7 @@ A Chrome extension for managing your AI conversations across multiple platforms 
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/YOUR_USERNAME/ai-chat-manager.git
+   git clone https://github.com/rudolfjeffery6/ai-chat-manager.git
    cd ai-chat-manager
    ```
 
@@ -61,7 +70,7 @@ A Chrome extension for managing your AI conversations across multiple platforms 
 
 4. **Search**: Type in the search box to filter conversations.
 
-5. **Preview**: Click any conversation to see the last 3 messages.
+5. **Preview**: Click any conversation to see the message preview (cached for 24 hours).
 
 6. **Delete**:
    - Single: Click the × button on any conversation
@@ -119,6 +128,7 @@ src/
 - **Manifest V3**: Modern Chrome Extension with Service Workers
 - **Background Sync**: Sync logic runs in background, survives popup close
 - **Cache Strategy**: Per-platform caching with 5-minute freshness check
+- **Preview Cache**: 24-hour validity for message previews
 - **No External Services**: All data stays local, no third-party servers
 
 ### Adding New Platforms
@@ -153,4 +163,5 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## Acknowledgments
 
 - Built with TypeScript and Webpack
-- Uses ChatGPT's internal API (unofficial)
+- Uses ChatGPT and Claude internal APIs (unofficial)
+- Claude icon from [Bootstrap Icons](https://icons.getbootstrap.com/icons/claude/)
