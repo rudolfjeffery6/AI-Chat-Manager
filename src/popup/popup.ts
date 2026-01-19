@@ -10,6 +10,8 @@ import {
   getSyncProgressKey,
   getSyncErrorKey,
   getPreviewCacheKey,
+  getContentIndexKey,
+  getIndexProgressKey,
   PREVIEW_CACHE_EXPIRY_MS
 } from '../platforms/types'
 import type {
@@ -19,7 +21,9 @@ import type {
   SyncProgress,
   UnifiedConversation,
   UnifiedMessage,
-  PreviewCache
+  PreviewCache,
+  ContentIndex,
+  IndexProgress
 } from '../platforms/types'
 import { ErrorCode, ErrorMessages } from '../errors'
 
@@ -76,6 +80,17 @@ let lastSyncTime: number | null = null
 let syncComplete = false
 let syncProgress: SyncProgress | null = null
 
+// Content index data
+let contentIndex: ContentIndex = {}
+let indexProgress: IndexProgress | null = null
+
+// Search results with snippets
+interface SearchResult {
+  conv: UnifiedConversation
+  matchType: 'title' | 'content'
+  snippet: string | null
+}
+
 // Settings
 const SETTINGS_KEY = 'settings'
 let backupBeforeDeletePref = false
@@ -131,9 +146,11 @@ async function loadCache(): Promise<boolean> {
   const cacheKey = getCacheKey(currentPlatform)
   const progressKey = getSyncProgressKey(currentPlatform)
   const errorKey = getSyncErrorKey(currentPlatform)
+  const contentIndexKey = getContentIndexKey(currentPlatform)
+  const indexProgressKey = getIndexProgressKey(currentPlatform)
 
   return new Promise((resolve) => {
-    chrome.storage.local.get([cacheKey, progressKey, errorKey], (result) => {
+    chrome.storage.local.get([cacheKey, progressKey, errorKey, contentIndexKey, indexProgressKey], (result) => {
       logger.log(`[${currentPlatform}] loadCache: keys:`, Object.keys(result))
 
       const cache = result[cacheKey] as PlatformCache | undefined
@@ -153,6 +170,11 @@ async function loadCache(): Promise<boolean> {
       }
 
       syncProgress = result[progressKey] as SyncProgress | undefined || null
+
+      // Load content index
+      contentIndex = (result[contentIndexKey] as ContentIndex | undefined) || {}
+      indexProgress = (result[indexProgressKey] as IndexProgress | undefined) || null
+      logger.log(`[${currentPlatform}] loadCache: ${Object.keys(contentIndex).length} indexed conversations`)
 
       const syncError = result[errorKey] as string | undefined
       if (syncError) {
@@ -588,9 +610,20 @@ function updateSyncStatusBar() {
   } else {
     const countText = `${cachedConversations.length} conversations`
     const timeText = lastSyncTime ? `Last sync: ${formatRelativeTime(lastSyncTime)}` : ''
+
+    // Build index status text
+    let indexText = ''
+    const indexedCount = Object.keys(contentIndex).length
+    if (indexProgress?.inProgress) {
+      indexText = ` · Indexing ${indexProgress.indexed}/${indexProgress.total}`
+    } else if (indexedCount > 0) {
+      indexText = ` · ${indexedCount} indexed`
+    }
+
     statusBar.className = 'sync-status-bar'
     statusBar.innerHTML = `
-      <span>${countText}${timeText ? ' · ' + timeText : ''}</span>
+      <span>${countText}${timeText ? ' · ' + timeText : ''}${indexText}</span>
+      ${indexProgress?.inProgress ? '<span class="index-indicator">📝</span>' : ''}
       <button id="manualSyncBtn" class="manual-sync-btn" title="Sync now">↻</button>
     `
     attachSyncButtonHandler()
@@ -809,14 +842,55 @@ function updateBatchDeleteBtn() {
   }
 }
 
-function filterConversations(conversations: UnifiedConversation[], query: string): UnifiedConversation[] {
-  if (!query.trim()) return conversations
+function extractSearchSnippet(text: string, query: string): string {
+  const lowerText = text.toLowerCase()
+  const lowerQuery = query.toLowerCase()
+  const index = lowerText.indexOf(lowerQuery)
+  if (index === -1) return ''
+
+  const start = Math.max(0, index - 30)
+  const end = Math.min(text.length, index + query.length + 30)
+  const prefix = start > 0 ? '...' : ''
+  const suffix = end < text.length ? '...' : ''
+  return prefix + text.slice(start, end) + suffix
+}
+
+function searchConversations(conversations: UnifiedConversation[], query: string): SearchResult[] {
+  if (!query.trim()) {
+    return conversations.map(conv => ({ conv, matchType: 'title' as const, snippet: null }))
+  }
+
   const lowerQuery = query.toLowerCase().trim()
-  return conversations.filter(conv => {
+  const results: SearchResult[] = []
+
+  for (const conv of conversations) {
     const title = (conv.title || '').toLowerCase()
-    const snippet = (conv.snippet || '').toLowerCase()
-    return title.includes(lowerQuery) || snippet.includes(lowerQuery)
-  })
+
+    // Check title match first
+    if (title.includes(lowerQuery)) {
+      results.push({ conv, matchType: 'title', snippet: null })
+      continue
+    }
+
+    // Check indexed content
+    const indexed = contentIndex[conv.id]
+    if (indexed?.contentText) {
+      const contentLower = indexed.contentText.toLowerCase()
+      if (contentLower.includes(lowerQuery)) {
+        const snippet = extractSearchSnippet(indexed.contentText, query)
+        results.push({ conv, matchType: 'content', snippet })
+        continue
+      }
+    }
+
+    // Also check snippet field (from preview)
+    const snippetText = (conv.snippet || '').toLowerCase()
+    if (snippetText.includes(lowerQuery)) {
+      results.push({ conv, matchType: 'title', snippet: null })
+    }
+  }
+
+  return results
 }
 
 function sortConversations(conversations: UnifiedConversation[], sortBy: SortOption): UnifiedConversation[] {
@@ -839,9 +913,35 @@ function sortConversations(conversations: UnifiedConversation[], sortBy: SortOpt
   return sorted
 }
 
+function sortSearchResults(results: SearchResult[], sortBy: SortOption): SearchResult[] {
+  const sorted = [...results]
+  switch (sortBy) {
+    case 'updated':
+      sorted.sort((a, b) => b.conv.updateTime - a.conv.updateTime)
+      break
+    case 'created':
+      sorted.sort((a, b) => b.conv.createTime - a.conv.createTime)
+      break
+    case 'title':
+      sorted.sort((a, b) => {
+        const titleA = (a.conv.title || '').toLowerCase()
+        const titleB = (b.conv.title || '').toLowerCase()
+        return titleA.localeCompare(titleB)
+      })
+      break
+  }
+  return sorted
+}
+
+function searchAndSortConversations(conversations: UnifiedConversation[], query: string, sortBy: SortOption): SearchResult[] {
+  const results = searchConversations(conversations, query)
+  return sortSearchResults(results, sortBy)
+}
+
+// Legacy function for backward compatibility
 function filterAndSortConversations(conversations: UnifiedConversation[], query: string, sortBy: SortOption): UnifiedConversation[] {
-  const filtered = filterConversations(conversations, query)
-  return sortConversations(filtered, sortBy)
+  const results = searchAndSortConversations(conversations, query, sortBy)
+  return results.map(r => r.conv)
 }
 
 function renderSearchBox(): string {
@@ -898,18 +998,30 @@ function updateListItems() {
 
   if (!listContainer) return
 
-  const filteredConversations = filterAndSortConversations(cachedConversations, searchQuery, currentSortOption)
+  // Use content-aware search when query exists, otherwise just sort
+  const searchResults = searchQuery
+    ? searchAndSortConversations(cachedConversations, searchQuery, currentSortOption)
+    : sortSearchResults(
+        cachedConversations.map(conv => ({ conv, matchType: 'title' as const, snippet: null })),
+        currentSortOption
+      )
 
   if (resultCountEl) {
     if (searchQuery) {
-      resultCountEl.textContent = `${filteredConversations.length} results`
+      const contentMatches = searchResults.filter(r => r.matchType === 'content').length
+      const titleMatches = searchResults.length - contentMatches
+      let countText = `${searchResults.length} results`
+      if (contentMatches > 0) {
+        countText += ` (${contentMatches} in content)`
+      }
+      resultCountEl.textContent = countText
       resultCountEl.classList.remove('hidden')
     } else {
       resultCountEl.classList.add('hidden')
     }
   }
 
-  if (filteredConversations.length === 0 && searchQuery) {
+  if (searchResults.length === 0 && searchQuery) {
     listContainer.innerHTML = `
       <div class="no-results">
         <div class="no-results-icon">🔍</div>
@@ -920,23 +1032,33 @@ function updateListItems() {
     return
   }
 
-  const listHtml = filteredConversations.map(conv => renderConversationItem(conv)).join('')
+  const listHtml = searchResults.map(r => renderConversationItem(r.conv, r.snippet)).join('')
   listContainer.innerHTML = listHtml
   attachListItemHandlers()
 }
 
-function renderConversationItem(conv: UnifiedConversation): string {
+function renderConversationItem(conv: UnifiedConversation, searchSnippet?: string | null): string {
   const isDeleting = deletingIds.has(conv.id)
   const snippetText = conv.snippet || ''
   const countText = conv.messageCount ? `${conv.messageCount} msgs` : ''
   const starIcon = conv.isStarred ? '⭐ ' : ''
+
+  // Display search snippet if it's a content match, otherwise show normal snippet
+  let snippetHtml: string
+  if (searchSnippet) {
+    snippetHtml = `<span class="content-match">"${escapeHtml(searchSnippet)}"</span>`
+  } else if (snippetText) {
+    snippetHtml = escapeHtml(snippetText)
+  } else {
+    snippetHtml = '<span class="no-preview">(Click to load preview)</span>'
+  }
 
   return `
     <div class="conversation-item ${isDeleting ? 'deleting' : ''}" data-id="${conv.id}" data-title="${escapeHtml(conv.title || 'Untitled')}">
       <input type="checkbox" class="conv-checkbox" data-id="${conv.id}" ${selectedForDelete.has(conv.id) ? 'checked' : ''} ${isDeleting ? 'disabled' : ''}>
       <div class="conv-content">
         <div class="conv-title">${starIcon}${escapeHtml(conv.title || 'Untitled')}</div>
-        <div class="conv-snippet">${snippetText ? escapeHtml(snippetText) : '<span class="no-preview">(Click to load preview)</span>'}</div>
+        <div class="conv-snippet">${snippetHtml}</div>
         <div class="conv-meta">
           <span class="conv-date">${formatRelativeTime(conv.updateTime)}</span>
           ${countText ? `<span class="conv-count">${countText}</span>` : ''}
@@ -1230,6 +1352,8 @@ function setupStorageListener() {
     const cacheKey = getCacheKey(currentPlatform)
     const progressKey = getSyncProgressKey(currentPlatform)
     const errorKey = getSyncErrorKey(currentPlatform)
+    const contentIndexKey = getContentIndexKey(currentPlatform)
+    const indexProgressKey = getIndexProgressKey(currentPlatform)
 
     // Update conversation cache
     if (changes[cacheKey]?.newValue) {
@@ -1259,6 +1383,18 @@ function setupStorageListener() {
     // Update sync progress
     if (changes[progressKey]) {
       syncProgress = changes[progressKey].newValue as SyncProgress | undefined || null
+      updateSyncStatusBar()
+    }
+
+    // Update content index
+    if (changes[contentIndexKey]?.newValue) {
+      contentIndex = changes[contentIndexKey].newValue as ContentIndex || {}
+      logger.log(`[${currentPlatform}] Content index updated: ${Object.keys(contentIndex).length} indexed`)
+    }
+
+    // Update index progress
+    if (changes[indexProgressKey]) {
+      indexProgress = changes[indexProgressKey].newValue as IndexProgress | undefined || null
       updateSyncStatusBar()
     }
 

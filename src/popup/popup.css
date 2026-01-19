@@ -740,6 +740,14 @@ h1 {
   font-style: italic;
 }
 
+.conv-snippet .content-match {
+  color: var(--orange);
+  font-style: italic;
+  background: var(--orange-lightest);
+  padding: 1px 4px;
+  border-radius: var(--radius-sm);
+}
+
 .conv-meta {
   display: flex;
   align-items: center;

@@ -9,12 +9,17 @@ import {
   getCacheKey,
   getSyncProgressKey,
   getSyncErrorKey,
-  getBackupKey
+  getBackupKey,
+  getContentIndexKey,
+  getIndexProgressKey,
+  INDEX_CONFIG
 } from './platforms/types'
 import type {
   PlatformType,
   PlatformCache,
-  UnifiedConversation
+  UnifiedConversation,
+  ContentIndex,
+  IndexProgress
 } from './platforms/types'
 import { ErrorCode } from './errors'
 
@@ -82,6 +87,20 @@ const syncState: Record<PlatformType, { inProgress: boolean; aborted: boolean }>
   gemini: { inProgress: false, aborted: false }
 }
 
+// Index state per platform
+const indexState: Record<PlatformType, { inProgress: boolean; aborted: boolean; timeoutId?: ReturnType<typeof setTimeout> }> = {
+  chatgpt: { inProgress: false, aborted: false },
+  claude: { inProgress: false, aborted: false },
+  gemini: { inProgress: false, aborted: false }
+}
+
+// Priority queue for indexing (conversation IDs that user previewed)
+const priorityIndexQueue: Record<PlatformType, string[]> = {
+  chatgpt: [],
+  claude: [],
+  gemini: []
+}
+
 // Sync constants
 const SYNC_BATCH_SIZE = 50
 const SYNC_DELAY_MS = 300
@@ -109,6 +128,275 @@ async function getStoredToken(platform: PlatformType): Promise<string | null> {
  */
 async function storeToken(platform: PlatformType, token: string): Promise<void> {
   await chrome.storage.session.set({ [`${platform}_token`]: token })
+}
+
+// ==================== Content Indexing System ====================
+
+/**
+ * Get content index from storage
+ */
+async function getContentIndex(platform: PlatformType): Promise<ContentIndex> {
+  return new Promise((resolve) => {
+    chrome.storage.local.get([getContentIndexKey(platform)], (result) => {
+      resolve((result[getContentIndexKey(platform)] as ContentIndex) || {})
+    })
+  })
+}
+
+/**
+ * Save content index to storage
+ */
+async function saveContentIndex(platform: PlatformType, index: ContentIndex): Promise<void> {
+  await chrome.storage.local.set({ [getContentIndexKey(platform)]: index })
+}
+
+/**
+ * Get index progress from storage
+ */
+async function getIndexProgress(platform: PlatformType): Promise<IndexProgress | null> {
+  return new Promise((resolve) => {
+    chrome.storage.local.get([getIndexProgressKey(platform)], (result) => {
+      resolve((result[getIndexProgressKey(platform)] as IndexProgress) || null)
+    })
+  })
+}
+
+/**
+ * Save index progress to storage
+ */
+async function saveIndexProgress(platform: PlatformType, progress: IndexProgress): Promise<void> {
+  await chrome.storage.local.set({ [getIndexProgressKey(platform)]: progress })
+}
+
+/**
+ * Add conversation to priority index queue (for user previews)
+ */
+function addToPriorityQueue(platform: PlatformType, conversationId: string) {
+  const queue = priorityIndexQueue[platform]
+  if (!queue.includes(conversationId)) {
+    queue.unshift(conversationId) // Add to front
+  }
+}
+
+/**
+ * Index a single conversation
+ */
+async function indexConversation(platform: PlatformType, conversationId: string): Promise<boolean> {
+  const adapter = getPlatform(platform)
+  if (!adapter) return false
+
+  const storedToken = await getStoredToken(platform)
+  if (storedToken) {
+    adapter.setToken(storedToken)
+  }
+
+  try {
+    const messages = await adapter.getConversationDetail(conversationId)
+
+    // Concatenate all message content
+    let contentText = messages
+      .map(m => m.content)
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+
+    // Limit to max length
+    if (contentText.length > INDEX_CONFIG.maxContentLength) {
+      contentText = contentText.substring(0, INDEX_CONFIG.maxContentLength)
+    }
+
+    // Save to index
+    const index = await getContentIndex(platform)
+    index[conversationId] = {
+      contentText,
+      indexedAt: Date.now()
+    }
+
+    // Enforce max indexed conversations (remove oldest)
+    const entries = Object.entries(index)
+    if (entries.length > INDEX_CONFIG.maxIndexedConversations) {
+      entries.sort((a, b) => a[1].indexedAt - b[1].indexedAt)
+      const toRemove = entries.slice(0, entries.length - INDEX_CONFIG.maxIndexedConversations)
+      for (const [id] of toRemove) {
+        delete index[id]
+      }
+    }
+
+    await saveContentIndex(platform, index)
+    return true
+  } catch (err) {
+    const errorMsg = String(err)
+    if (errorMsg.includes('429')) {
+      throw new Error('RATE_LIMITED')
+    }
+    throw err
+  }
+}
+
+/**
+ * Start background content indexing
+ */
+async function startContentIndexing(platform: PlatformType) {
+  const state = indexState[platform]
+
+  if (state.inProgress) {
+    logger.log(`[${platform}] Indexing already in progress`)
+    return
+  }
+
+  // Get cached conversations
+  const cached = await chrome.storage.local.get(getCacheKey(platform))
+  const cache = cached[getCacheKey(platform)] as PlatformCache | undefined
+
+  if (!cache?.conversations?.length) {
+    logger.log(`[${platform}] No conversations to index`)
+    return
+  }
+
+  const conversations = cache.conversations
+  const contentIndex = await getContentIndex(platform)
+
+  // Find conversations that need indexing (not already indexed)
+  const needsIndexing = conversations
+    .filter(c => !contentIndex[c.id])
+    .sort((a, b) => b.updateTime - a.updateTime) // Newest first
+
+  if (needsIndexing.length === 0) {
+    logger.log(`[${platform}] All conversations already indexed`)
+    await saveIndexProgress(platform, {
+      indexed: Object.keys(contentIndex).length,
+      total: conversations.length,
+      inProgress: false
+    })
+    return
+  }
+
+  state.inProgress = true
+  state.aborted = false
+
+  diagLog('INFO', 'Content indexing started', {
+    platform,
+    message: `${needsIndexing.length} conversations to index`
+  })
+
+  // Start indexing loop
+  indexNextConversation(platform, needsIndexing, 0)
+}
+
+/**
+ * Index next conversation in queue
+ */
+async function indexNextConversation(
+  platform: PlatformType,
+  queue: UnifiedConversation[],
+  currentIndex: number
+) {
+  const state = indexState[platform]
+
+  if (state.aborted || currentIndex >= queue.length) {
+    state.inProgress = false
+    const index = await getContentIndex(platform)
+    const cached = await chrome.storage.local.get(getCacheKey(platform))
+    const cache = cached[getCacheKey(platform)] as PlatformCache | undefined
+
+    await saveIndexProgress(platform, {
+      indexed: Object.keys(index).length,
+      total: cache?.conversations?.length || 0,
+      inProgress: false
+    })
+
+    if (!state.aborted) {
+      diagLog('INFO', 'Content indexing completed', {
+        platform,
+        message: `${Object.keys(index).length} conversations indexed`
+      })
+    }
+    return
+  }
+
+  // Check priority queue first
+  const priorityId = priorityIndexQueue[platform].shift()
+  let conversationId: string
+  let skipIndex = false
+
+  if (priorityId) {
+    // Check if priority item needs indexing
+    const index = await getContentIndex(platform)
+    if (!index[priorityId]) {
+      conversationId = priorityId
+      skipIndex = true // Don't advance the queue index
+    } else {
+      conversationId = queue[currentIndex].id
+    }
+  } else {
+    conversationId = queue[currentIndex].id
+  }
+
+  // Update progress
+  const cached = await chrome.storage.local.get(getCacheKey(platform))
+  const cache = cached[getCacheKey(platform)] as PlatformCache | undefined
+  const index = await getContentIndex(platform)
+
+  await saveIndexProgress(platform, {
+    indexed: Object.keys(index).length,
+    total: cache?.conversations?.length || 0,
+    inProgress: true,
+    currentId: conversationId
+  })
+
+  try {
+    await indexConversation(platform, conversationId)
+    logger.log(`[${platform}] Indexed conversation ${conversationId.slice(0, 8)}...`)
+
+    // Schedule next
+    state.timeoutId = setTimeout(() => {
+      indexNextConversation(platform, queue, skipIndex ? currentIndex : currentIndex + 1)
+    }, INDEX_CONFIG.requestInterval)
+
+  } catch (err) {
+    const errorMsg = String(err)
+    let pauseTime = INDEX_CONFIG.pauseOnError
+
+    if (errorMsg.includes('RATE_LIMITED') || errorMsg.includes('429')) {
+      pauseTime = INDEX_CONFIG.pauseOn429
+      diagLog('WARN', 'Indexing rate limited', {
+        platform,
+        message: `Pausing for ${pauseTime / 1000}s`
+      })
+    } else {
+      diagLog('WARN', 'Indexing error', {
+        platform,
+        message: errorMsg
+      })
+    }
+
+    // Update progress with pause info
+    await saveIndexProgress(platform, {
+      indexed: Object.keys(index).length,
+      total: cache?.conversations?.length || 0,
+      inProgress: true,
+      pausedUntil: Date.now() + pauseTime
+    })
+
+    // Resume after pause
+    state.timeoutId = setTimeout(() => {
+      indexNextConversation(platform, queue, skipIndex ? currentIndex : currentIndex + 1)
+    }, pauseTime)
+  }
+}
+
+/**
+ * Stop content indexing
+ */
+function stopContentIndexing(platform: PlatformType) {
+  const state = indexState[platform]
+  state.aborted = true
+  if (state.timeoutId) {
+    clearTimeout(state.timeoutId)
+    state.timeoutId = undefined
+  }
+  state.inProgress = false
+  logger.log(`[${platform}] Indexing stopped`)
 }
 
 /**
@@ -209,6 +497,8 @@ async function startSync(platform: PlatformType, forceRefresh = false) {
           platform,
           message: `${allConversations.length} conversations synced`
         })
+        // Trigger background content indexing after sync
+        setTimeout(() => startContentIndexing(platform), 2000)
         break
       }
 
@@ -504,6 +794,47 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         diagLog('INFO', 'Logs cleared')
         sendResponse({ success: true })
       })
+      return true
+    }
+
+    // === Content Indexing ===
+    if (message.type === 'GET_CONTENT_INDEX') {
+      const platform = (message.platform || 'chatgpt') as PlatformType
+      getContentIndex(platform).then(index => sendResponse({ index }))
+      return true
+    }
+
+    if (message.type === 'GET_INDEX_PROGRESS') {
+      const platform = (message.platform || 'chatgpt') as PlatformType
+      getIndexProgress(platform).then(progress => sendResponse({ progress }))
+      return true
+    }
+
+    if (message.type === 'START_INDEXING') {
+      const platform = (message.platform || 'chatgpt') as PlatformType
+      startContentIndexing(platform)
+      sendResponse({ status: 'started' })
+      return true
+    }
+
+    if (message.type === 'STOP_INDEXING') {
+      const platform = (message.platform || 'chatgpt') as PlatformType
+      stopContentIndexing(platform)
+      sendResponse({ status: 'stopped' })
+      return true
+    }
+
+    if (message.type === 'PRIORITY_INDEX') {
+      const platform = (message.platform || 'chatgpt') as PlatformType
+      const conversationId = message.conversationId as string
+      if (conversationId) {
+        addToPriorityQueue(platform, conversationId)
+        // If not already indexing, start indexing
+        if (!indexState[platform].inProgress) {
+          startContentIndexing(platform)
+        }
+      }
+      sendResponse({ status: 'queued' })
       return true
     }
 

@@ -127,3 +127,39 @@ export interface PreviewCache {
 
 // Preview cache expiry (24 hours)
 export const PREVIEW_CACHE_EXPIRY_MS = 24 * 60 * 60 * 1000
+
+// Content index types
+export interface ContentIndexEntry {
+  contentText: string    // All messages concatenated, max 2000 chars
+  indexedAt: number
+}
+
+export interface ContentIndex {
+  [conversationId: string]: ContentIndexEntry
+}
+
+export interface IndexProgress {
+  indexed: number
+  total: number
+  inProgress: boolean
+  currentId?: string
+  pausedUntil?: number  // Timestamp when pause ends (for rate limiting)
+}
+
+// Content index storage key
+export function getContentIndexKey(platform: PlatformType): string {
+  return `${platform}_content_index`
+}
+
+export function getIndexProgressKey(platform: PlatformType): string {
+  return `${platform}_index_progress`
+}
+
+// Index config
+export const INDEX_CONFIG = {
+  requestInterval: 5000,      // 5 seconds between requests
+  pauseOn429: 60000,          // Pause 60 seconds on rate limit
+  pauseOnError: 30000,        // Pause 30 seconds on other errors
+  maxContentLength: 2000,     // Max chars per conversation
+  maxIndexedConversations: 500 // Max conversations to index
+}
