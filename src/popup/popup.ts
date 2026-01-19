@@ -34,6 +34,14 @@ const backupCheckbox = document.getElementById('backupCheckbox') as HTMLInputEle
 const cancelBtn = document.getElementById('cancelBtn') as HTMLButtonElement
 const confirmBtn = document.getElementById('confirmBtn') as HTMLButtonElement
 
+// Sort options
+type SortOption = 'updated' | 'created' | 'title'
+const SORT_OPTIONS: { value: SortOption; label: string }[] = [
+  { value: 'updated', label: 'Recent Update' },
+  { value: 'created', label: 'Created Time' },
+  { value: 'title', label: 'Title A-Z' }
+]
+
 // State
 let currentPlatform: PlatformType = 'chatgpt'
 let platforms: PlatformConfig[] = []
@@ -43,6 +51,7 @@ let pendingDeleteIds: string[] = []
 let currentView: 'conversations' | 'backups' = 'conversations'
 let selectedForDelete: Set<string> = new Set()
 let searchQuery: string = ''
+let currentSortOption: SortOption = 'updated'
 
 // Loading states
 let deletingIds: Set<string> = new Set()
@@ -66,7 +75,7 @@ async function loadPlatforms(): Promise<void> {
 // Load user settings from storage
 async function loadSettings(): Promise<void> {
   return new Promise((resolve) => {
-    chrome.storage.local.get([SETTINGS_KEY, 'lastPlatform'], (result) => {
+    chrome.storage.local.get([SETTINGS_KEY, 'lastPlatform', 'sortOption'], (result) => {
       const settings = result[SETTINGS_KEY] as { backupBeforeDelete?: boolean } | undefined
       if (settings?.backupBeforeDelete !== undefined) {
         backupBeforeDeletePref = settings.backupBeforeDelete
@@ -74,6 +83,10 @@ async function loadSettings(): Promise<void> {
       // Restore last used platform
       if (result.lastPlatform && platforms.some(p => p.name === result.lastPlatform)) {
         currentPlatform = result.lastPlatform as PlatformType
+      }
+      // Restore sort option
+      if (result.sortOption && SORT_OPTIONS.some(o => o.value === result.sortOption)) {
+        currentSortOption = result.sortOption as SortOption
       }
       resolve()
     })
@@ -789,12 +802,48 @@ function filterConversations(conversations: UnifiedConversation[], query: string
   })
 }
 
+function sortConversations(conversations: UnifiedConversation[], sortBy: SortOption): UnifiedConversation[] {
+  const sorted = [...conversations]
+  switch (sortBy) {
+    case 'updated':
+      sorted.sort((a, b) => b.updateTime - a.updateTime)
+      break
+    case 'created':
+      sorted.sort((a, b) => b.createTime - a.createTime)
+      break
+    case 'title':
+      sorted.sort((a, b) => {
+        const titleA = (a.title || '').toLowerCase()
+        const titleB = (b.title || '').toLowerCase()
+        return titleA.localeCompare(titleB)
+      })
+      break
+  }
+  return sorted
+}
+
+function filterAndSortConversations(conversations: UnifiedConversation[], query: string, sortBy: SortOption): UnifiedConversation[] {
+  const filtered = filterConversations(conversations, query)
+  return sortConversations(filtered, sortBy)
+}
+
 function renderSearchBox(): string {
+  const sortOptionsHtml = SORT_OPTIONS.map(opt =>
+    `<option value="${opt.value}" ${opt.value === currentSortOption ? 'selected' : ''}>${opt.label}</option>`
+  ).join('')
+
   return `
-    <div class="search-box">
-      <span class="search-icon">🔍</span>
-      <input type="text" id="searchInput" class="search-input" placeholder="Search conversations..." value="${escapeHtml(searchQuery)}">
-      <button id="clearSearchBtn" class="clear-search-btn ${searchQuery ? '' : 'hidden'}" title="Clear">×</button>
+    <div class="search-sort-row">
+      <div class="search-box">
+        <span class="search-icon">🔍</span>
+        <input type="text" id="searchInput" class="search-input" placeholder="Search conversations..." value="${escapeHtml(searchQuery)}">
+        <button id="clearSearchBtn" class="clear-search-btn ${searchQuery ? '' : 'hidden'}" title="Clear">×</button>
+      </div>
+      <div class="sort-box">
+        <select id="sortSelect" class="sort-select">
+          ${sortOptionsHtml}
+        </select>
+      </div>
     </div>
   `
 }
@@ -802,6 +851,7 @@ function renderSearchBox(): string {
 function attachSearchHandlers() {
   const searchInput = document.getElementById('searchInput') as HTMLInputElement
   const clearBtn = document.getElementById('clearSearchBtn') as HTMLButtonElement
+  const sortSelect = document.getElementById('sortSelect') as HTMLSelectElement
 
   searchInput?.addEventListener('input', () => {
     searchQuery = searchInput.value
@@ -816,6 +866,13 @@ function attachSearchHandlers() {
     updateListItems()
     searchInput?.focus()
   })
+
+  sortSelect?.addEventListener('change', () => {
+    currentSortOption = sortSelect.value as SortOption
+    // Save sort preference
+    chrome.storage.local.set({ sortOption: currentSortOption })
+    updateListItems()
+  })
 }
 
 function updateListItems() {
@@ -824,7 +881,7 @@ function updateListItems() {
 
   if (!listContainer) return
 
-  const filteredConversations = filterConversations(cachedConversations, searchQuery)
+  const filteredConversations = filterAndSortConversations(cachedConversations, searchQuery, currentSortOption)
 
   if (resultCountEl) {
     if (searchQuery) {
@@ -925,7 +982,7 @@ function renderConversationList(conversations: UnifiedConversation[]) {
     selectedForDelete.clear()
   }
 
-  const filteredConversations = filterConversations(conversations, searchQuery)
+  const filteredConversations = filterAndSortConversations(conversations, searchQuery, currentSortOption)
   const platform = platforms.find(p => p.name === currentPlatform)
 
   if (conversations.length === 0) {
