@@ -1364,19 +1364,19 @@ function setupStorageListener() {
       logger.log(`[${currentPlatform}] Cache updated: ${cachedConversations.length} conversations`)
 
       if (currentView === 'conversations' && deletingIds.size === 0) {
-        // Preserve scroll position during sync updates
+        // Check if the list is already rendered
         const listContainer = document.querySelector('.conversation-list')
-        const scrollTop = listContainer?.scrollTop || 0
-
-        renderConversationList(cachedConversations)
-
-        // Restore scroll position after render
-        if (scrollTop > 0) {
-          const newListContainer = document.querySelector('.conversation-list')
-          if (newListContainer) {
-            newListContainer.scrollTop = scrollTop
-          }
+        if (listContainer) {
+          // Just update list items without re-rendering entire page
+          // This preserves search input focus and value
+          const scrollTop = listContainer.scrollTop || 0
+          updateListItems()
+          listContainer.scrollTop = scrollTop
+        } else {
+          // List not yet rendered, do full render
+          renderConversationList(cachedConversations)
         }
+        updateSyncStatusBar()
       }
     }
 
