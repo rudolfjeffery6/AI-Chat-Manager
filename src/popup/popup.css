@@ -1223,56 +1223,6 @@ h1 {
 }
 
 /* -----------------------------
-   Summary Preview with Loading
-   ----------------------------- */
-.preview-summary {
-  position: relative;
-}
-
-.summary-content {
-  padding: var(--space-md);
-  background: var(--orange-lightest);
-  border-radius: var(--radius-md);
-  margin-bottom: var(--space-md);
-}
-
-.summary-label {
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--orange);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  margin-bottom: var(--space-xs);
-}
-
-.summary-text {
-  font-size: 13px;
-  line-height: 1.6;
-  color: var(--text-primary);
-}
-
-.loading-overlay {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-sm);
-  padding: var(--space-md);
-  background: var(--bg-secondary);
-  border-radius: var(--radius-md);
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
-.loading-overlay.error {
-  background: var(--danger-light);
-  color: var(--danger);
-}
-
-.loading-overlay .error-icon {
-  font-size: 14px;
-}
-
-/* -----------------------------
    Preview Transition Animation
    ----------------------------- */
 .preview-transitioning {

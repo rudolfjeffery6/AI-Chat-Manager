@@ -661,28 +661,6 @@ async function savePreviewCache(conversationId: string, messages: UnifiedMessage
   await chrome.storage.local.set({ [cacheKey]: cache })
 }
 
-/**
- * Render summary as initial preview content
- */
-function renderSummaryPreview(summary: string, conversationId: string, title: string): string {
-  const platform = platforms.find(p => p.name === currentPlatform)
-  return `
-    <div class="preview-messages preview-summary">
-      <div class="summary-content">
-        <div class="summary-label">Summary</div>
-        <div class="summary-text">${escapeHtml(summary)}</div>
-      </div>
-      <div class="loading-overlay">
-        <span class="spinner-small"></span>
-        <span>Loading full conversation...</span>
-      </div>
-    </div>
-    <div class="preview-actions">
-      <button class="delete-btn" data-id="${conversationId}" data-title="${escapeHtml(title)}">Delete Conversation</button>
-    </div>
-  `
-}
-
 async function showConversationPreview(conversationId: string, title: string) {
   selectedConversationId = conversationId
 
@@ -694,24 +672,17 @@ async function showConversationPreview(conversationId: string, title: string) {
   if (!previewDiv) return
 
   const conv = cachedConversations.find(c => c.id === conversationId)
-  const summary = conv?.summary
 
-  // Step 1: Show summary immediately if available (instant feedback)
-  if (summary) {
-    previewDiv.innerHTML = renderSummaryPreview(summary, conversationId, title)
-    attachPreviewDeleteHandler(previewDiv)
-  } else {
-    previewDiv.innerHTML = '<p class="loading">Loading preview...</p>'
-  }
-
-  // Step 2: Check preview cache (24h validity)
+  // Step 1: Check preview cache first (24h validity) - instant if cached
   const cachedMessages = await getValidPreviewCache(conversationId)
   if (cachedMessages) {
-    // Cache hit - show immediately
     logger.log(`[preview] Cache hit for ${conversationId}`)
     showFullPreview(previewDiv, cachedMessages, conversationId, title, conv)
     return
   }
+
+  // Step 2: Show loading state while fetching
+  previewDiv.innerHTML = '<p class="loading">Loading preview...</p>'
 
   // Step 3: Fetch from API
   try {
@@ -722,16 +693,7 @@ async function showConversationPreview(conversationId: string, title: string) {
     })
 
     if (response.error) {
-      // If we have summary, keep showing it as fallback
-      if (summary) {
-        const overlay = previewDiv.querySelector('.loading-overlay')
-        if (overlay) {
-          overlay.innerHTML = `<span class="error-icon">⚠</span><span>${parseError(response.error)}</span>`
-          overlay.classList.add('error')
-        }
-      } else {
-        previewDiv.innerHTML = `<p class="error-text">${parseError(response.error)}</p>`
-      }
+      previewDiv.innerHTML = `<p class="error-text">${parseError(response.error)}</p>`
       return
     }
 
@@ -740,19 +702,11 @@ async function showConversationPreview(conversationId: string, title: string) {
     // Save to cache for next time
     await savePreviewCache(conversationId, messages)
 
-    // Show full preview with smooth transition
+    // Show full preview
     showFullPreview(previewDiv, messages, conversationId, title, conv)
 
   } catch (err) {
-    if (summary) {
-      const overlay = previewDiv.querySelector('.loading-overlay')
-      if (overlay) {
-        overlay.innerHTML = `<span class="error-icon">⚠</span><span>Failed to load</span>`
-        overlay.classList.add('error')
-      }
-    } else {
-      previewDiv.innerHTML = `<p class="error-text">Failed to load preview</p>`
-    }
+    previewDiv.innerHTML = `<p class="error-text">Failed to load preview</p>`
   }
 }
 
@@ -1212,7 +1166,19 @@ function setupStorageListener() {
       logger.log(`[${currentPlatform}] Cache updated: ${cachedConversations.length} conversations`)
 
       if (currentView === 'conversations' && deletingIds.size === 0) {
+        // Preserve scroll position during sync updates
+        const listContainer = document.querySelector('.conversation-list')
+        const scrollTop = listContainer?.scrollTop || 0
+
         renderConversationList(cachedConversations)
+
+        // Restore scroll position after render
+        if (scrollTop > 0) {
+          const newListContainer = document.querySelector('.conversation-list')
+          if (newListContainer) {
+            newListContainer.scrollTop = scrollTop
+          }
+        }
       }
     }
 
